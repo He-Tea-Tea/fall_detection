@@ -1,0 +1,74 @@
+# 跌倒检测配置
+
+# YOLO Pose 模型与推理
+model: yolo26n-pose.pt
+pose_conf: 0.45            # 检测置信度阈值
+tracker: botsort.yaml      # 跟踪器配置（BYTETrack/BotSORT）
+
+# 工作距离（米，对应设计文档距离策略）
+near_distance_m: 3.0       # < 3m 高精度区（Pose+Depth+完整FallScore）
+max_reliable_distance_m: 6.0  # > 6m 只观察不计算跌倒
+
+# FallScore 权重（五项评分加权求和）
+weights:
+  pose: 0.30
+  height: 0.25
+  velocity: 0.20
+  static: 0.15
+  scene: 0.10
+
+# 姿态异常：躯干倾角（度）
+pose_angle_normal: 30.0    # <30° 正常
+pose_angle_fall: 60.0      # >60° 高风险
+
+# 高度下降（米）
+height_drop_min_m: 0.15    # 下降 <0.15m 不计
+height_drop_full_m: 0.50   # 下降 >0.50m 记满分
+
+# 垂直下降速度（米/秒）
+velocity_normal_mps: 0.30  # <0.3m/s 低风险
+velocity_fall_mps: 0.80    # >0.8m/s 高风险
+
+# 倒地后静止（秒）
+static_start_s: 1.0
+static_full_s: 3.0
+static_motion_threshold_mps: 0.12  # 人体3D中心速度低于该值才认为接近静止
+
+# 状态机阈值（FallScore）
+score_suspect: 0.45
+score_falling: 0.65
+score_confirmed: 0.80
+
+confirm_frames: 8          # （预留）连续确认帧数
+recover_s: 2.0             # 恢复确认需持续的正常时间
+recover_angle_deg: 30.0    # 恢复判断时人体躯干倾角需小于该值
+
+# 数据质量控制
+quality_floor: 0.35        # 数据质量低于该值时降低 FallScore，避免低质量数据误报警
+min_confirm_quality: 0.45  # 只有数据质量达到该值才允许确认跌倒
+
+# 关键点最低置信度
+min_keypoint_conf: 0.50
+
+# 深度邻域取中值的窗口半径
+depth_window: 5
+
+# 场景分数（低风险=床/沙发/椅子/轮椅，高风险=地面）
+scene:
+  floor: 1.0
+  bed: 0.0
+  sofa: 0.1
+  chair: 0.0
+  wheelchair: 0.0
+  unknown: 0.5
+
+# # 相机内参
+# 注意：当前 main.py 已改为从 Gemini 335Le 自动读取真实内参，
+# 因此这里不再需要手动填写 fx/fy/cx/cy。
+# camera_intrinsics:
+#   width: 640
+#   height: 400
+#   fx: 304.692657
+#   fy: 304.635345
+#   cx: 317.000916
+#   cy: 206.366562

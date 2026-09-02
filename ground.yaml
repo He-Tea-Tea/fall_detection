@@ -1,0 +1,29 @@
+coordinate_system: RGB_COLOR_ALIGNED_DEPTH
+description: Ground plane fitted from Depth aligned to RGB color coordinates
+plane:
+  A: 0.007349463628441477
+  B: -0.9735389925468615
+  C: -0.22840274817789774
+  D: 0.8737041334056166
+normal:
+  x: 0.007349463628441477
+  y: -0.9735389925468615
+  z: -0.22840274817789774
+camera_intrinsics:
+  width: 640
+  height: 400
+  fx: 304.6926574707031
+  fy: 304.6353454589844
+  cx: 317.00091552734375
+  cy: 206.36656188964844
+ransac:
+  distance_threshold_m: 0.025
+  inlier_count: 96167
+  total_point_count: 108582
+  inlier_ratio: 0.885662448656315
+quality:
+  mean_error_m: 0.0037841403391212225
+  max_error_m: 0.024999797344207764
+  normal_y: 0.9735389925468615
+  normal_tilt_deg: 13.210010217703434
+  valid_ratio: 0.885662448656315
