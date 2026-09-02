@@ -1,74 +1,157 @@
-# 跌倒检测配置
+# ============================================================
+# 跌倒检测系统统一配置
+# 原则：除COCO关键点编号和数学极小量外，在线流程所有可调参数都放在此文件。
+# ground_detector.py是独立地面标定工具，不读取本文件中的算法参数。
+# ============================================================
+paths:                                      # 外部文件路径配置
+  ground_file: ground.yaml                  # 地面标定结果；相对路径以config.yaml所在目录为基准
+# 模型与推理
+models:                                     # YOLO模型、置信度和推理频率配置
+  pose_model: yolo26s-pose.pt               # 人体姿态模型；输出人体框、17个关键点，s版速度与精度较均衡
+  sense_model: yolo26s-seg.pt               # 家具实例分割模型；必须是-seg权重并能返回result.masks
+  pose_conf: 0.45                           # 人体检测最低置信度，范围0~1；调低可减少漏检但会增加误检
+  sense_conf: 0.35                          # 家具检测最低置信度，范围0~1；调低更容易识别遮挡家具但误检更多
+  sense_retina_masks: true                  # 是否输出接近原图尺寸的精细Mask；true边缘更准但显存和计算量略高
+  tracker: botsort.yaml                     # 人体多目标跟踪器配置；用于给同一个人维持稳定Track ID
+  sense_inference_interval_frames: 3        # 每隔多少帧运行一次家具Seg；调大更省算力但家具更新更慢
+# 相机在线运行参数
+camera:                                     # RGB-D取帧和地面标定一致性检查配置
+  frame_timeout_ms: 1000                    # 正常运行时等待一组相机帧的最长时间，单位毫秒
+  first_frame_timeout_ms: 3000              # 启动时每次等待首帧的最长时间，单位毫秒
+  first_frame_retries: 10                   # 首帧获取失败后的最大重试次数，超过后停止并报错
+  strict_ground_calibration: true           # true表示当前相机内参与标定不一致时禁止运行，防止高度和角度算错
+  focal_relative_tolerance: 0.02            # 焦距fx/fy允许的相对误差，0.02表示2%
+  principal_point_tolerance_px: 5.0         # 主点cx/cy允许的最大偏差，单位像素
+# Depth与3D反投影
+depth:                                      # 深度有效范围和关键点深度采样配置
+  min_depth_m: 0.30                         # 最小有效测量距离，单位米；更近的深度视为无效
+  max_depth_m: 6.00                         # 最大有效测量距离，单位米；超过后深度精度通常不足
+  window_size: 5                            # 关键点周围深度采样窗口边长，单位像素；必须为正奇数
+  min_valid_samples: 3                      # 窗口内至少需要的有效深度像素数，不足则该关键点无3D坐标
+# Pose与人体观测质量
+pose:                                       # 关键点有效性、可靠距离和综合质量评分配置
+  min_keypoint_conf: 0.50                   # 单个关键点最低置信度，范围0~1；低于此值不参与3D计算
+  min_valid_3d_keypoints: 4                 # 一个人至少需要的有效3D关键点数量，不足则不进入跌倒状态机
+  person_size_reference_px: 250.0           # 人框高度达到该像素值时尺寸质量近似满分，用于判断人是否太小太远
+  near_distance_m: 3.0                      # 距离质量的理想近距离参考值，单位米；此距离内通常质量最高
+  max_reliable_distance_m: 6.0              # 人体测量允许的最远可靠距离，单位米；超过后不参与跌倒判断
+  min_data_quality: 0.45                    # 人体综合数据质量最低值，范围0~1；低于此值只显示不判定
+  quality_weights:                          # 综合质量各证据权重；下面六项之和必须等于1
+    pose_confidence: 0.20                   # 2D关键点平均置信度权重
+    pose_coverage: 0.20                     # 有效2D关键点覆盖率权重
+    depth_coverage: 0.25                    # 有效3D关键点覆盖率权重，Depth可靠性影响最大
+    torso_coverage: 0.20                    # 左右肩和左右髋等躯干关键点完整度权重
+    person_size: 0.10                       # 人框像素尺寸权重，人物越大通常越容易可靠测量
+    distance: 0.05                          # 人体与相机距离权重，远距离会降低质量
+# body_angle.py：只控制人体方向角测量
+body_angle:                                 # 人体角度计算和滤波配置
+  history_length: 7                         # 角度中值滤波保存的最近有效帧数；调大更平稳但响应更慢
+  min_vector_length_m: 0.08                 # 人体方向向量最小长度，单位米；过短说明3D点异常或重合
+  allow_lower_body_fallback: true           # 肩部缺失时是否允许用髋到膝/踝估算角度；true可减少无角度帧
+# sense.py：只控制人与床/沙发/椅子/地面的关系
+sense:                                      # 家具Mask三维测量和人物场景关系配置
+  target_class_map:                         # 将模型原始类别名映射为系统统一场景名；未列出的类别会被忽略
+    bed: bed                                # YOLO类别bed映射为系统场景bed
+    couch: sofa                             # COCO预训练模型把沙发称为couch，这里统一映射为sofa
+    sofa: sofa                              # 兼容自训练模型直接使用sofa类别名
+    chair: chair                            # YOLO类别chair映射为系统场景chair
+  object_sample_step: 5                     # 家具Mask内每隔多少像素采一个Depth点；调小更细致但计算量更大
+  min_object_points: 15                     # 家具至少需要的有效3D采样点数，不足则放弃该家具的空间关系
+  mask_threshold: 0.50                      # Seg像素属于家具的最低概率，范围0~1；调高边缘更干净但Mask会变小
+  min_mask_area_px: 100                     # 家具Mask最小面积，单位像素；过滤很小且通常不可靠的分割结果
+  object_x_margin_ratio: 0.15               # 家具框左右各忽略的宽度比例，0.15表示左右各裁掉15%以避开边缘噪声
+  surface_bands:                            # 家具框中估计承载面的纵向比例；0是框顶部，1是框底部
+    bed: [0.20, 0.65]                       # 床框从顶部20%到65%的Mask区域用于提取床面Depth
+    sofa: [0.25, 0.70]                      # 沙发框从顶部25%到70%的Mask区域用于提取坐垫/靠背附近Depth
+    chair: [0.20, 0.65]                     # 椅子框从顶部20%到65%的Mask区域用于提取座面附近Depth
+  relation:                                 # 人体与家具/地面的单帧几何关系阈值
+    min_iou: 0.03                           # 人框与家具框最小二维交并比；达到后可作为接触证据
+    full_iou: 0.20                          # 二维交并比达到该值时IoU子分数记为满分
+    on_distance_m: 0.40                     # 人体关键点到家具最近距离不超过该值时视为可能接触，单位米
+    near_distance_m: 0.80                   # 人体到家具不超过该值时视为在家具附近，单位米
+    surface_height_tolerance_m: 0.30        # 髋部离地高度与家具表面高度允许差值，单位米
+    floor_hip_height_m: 0.22                # 髋部离地高度不超过该值时可支持“躺在地面”，单位米
+    standing_angle_max_deg: 35.0            # 人体角度不超过该值时视为接近站立/坐立，单位度；0度为竖直
+    lying_angle_min_deg: 55.0               # 人体角度达到该值时视为接近水平躺卧，单位度；90度为水平
+    confidence_weights:                     # 家具关系置信度的三项权重；总和必须等于1
+      iou: 0.35                             # 人框与家具框二维重叠证据权重
+      distance: 0.35                        # 人体与家具三维最近距离证据权重
+      height: 0.30                          # 髋部高度与家具承载面高度一致性权重
+    floor_confidence_weights:               # 躺在地面置信度的两项权重；总和必须等于1
+      angle: 0.50                           # 人体接近水平的角度证据权重
+      height: 0.50                          # 髋部接近地面的高度证据权重
+  confidence_threshold: 0.55                # 多帧关系平均置信度最低值；低于此值输出unknown
+  history_length: 10                        # 每个Track ID保存的最近场景关系帧数；调大更稳定但切换更慢
 
-# YOLO Pose 模型与推理
-model: yolo26n-pose.pt
-pose_conf: 0.45            # 检测置信度阈值
-tracker: botsort.yaml      # 跟踪器配置（BYTETrack/BotSORT）
-
-# 工作距离（米，对应设计文档距离策略）
-near_distance_m: 3.0       # < 3m 高精度区（Pose+Depth+完整FallScore）
-max_reliable_distance_m: 6.0  # > 6m 只观察不计算跌倒
-
-# FallScore 权重（五项评分加权求和）
-weights:
-  pose: 0.30
-  height: 0.25
-  velocity: 0.20
-  static: 0.15
-  scene: 0.10
-
-# 姿态异常：躯干倾角（度）
-pose_angle_normal: 30.0    # <30° 正常
-pose_angle_fall: 60.0      # >60° 高风险
-
-# 高度下降（米）
-height_drop_min_m: 0.15    # 下降 <0.15m 不计
-height_drop_full_m: 0.50   # 下降 >0.50m 记满分
-
-# 垂直下降速度（米/秒）
-velocity_normal_mps: 0.30  # <0.3m/s 低风险
-velocity_fall_mps: 0.80    # >0.8m/s 高风险
-
-# 倒地后静止（秒）
-static_start_s: 1.0
-static_full_s: 3.0
-static_motion_threshold_mps: 0.12  # 人体3D中心速度低于该值才认为接近静止
-
-# 状态机阈值（FallScore）
-score_suspect: 0.45
-score_falling: 0.65
-score_confirmed: 0.80
-
-confirm_frames: 8          # （预留）连续确认帧数
-recover_s: 2.0             # 恢复确认需持续的正常时间
-recover_angle_deg: 30.0    # 恢复判断时人体躯干倾角需小于该值
-
-# 数据质量控制
-quality_floor: 0.35        # 数据质量低于该值时降低 FallScore，避免低质量数据误报警
-min_confirm_quality: 0.45  # 只有数据质量达到该值才允许确认跌倒
-
-# 关键点最低置信度
-min_keypoint_conf: 0.50
-
-# 深度邻域取中值的窗口半径
-depth_window: 5
-
-# 场景分数（低风险=床/沙发/椅子/轮椅，高风险=地面）
-scene:
-  floor: 1.0
-  bed: 0.0
-  sofa: 0.1
-  chair: 0.0
-  wheelchair: 0.0
-  unknown: 0.5
-
-# # 相机内参
-# 注意：当前 main.py 已改为从 Gemini 335Le 自动读取真实内参，
-# 因此这里不再需要手动填写 fx/fy/cx/cy。
-# camera_intrinsics:
-#   width: 640
-#   height: 400
-#   fx: 304.692657
-#   fy: 304.635345
-#   cx: 317.000916
-#   cy: 206.366562
+# fall_detector.py：五项评分 + 二值状态机，只输出FALL / NO_FALL
+fall_detector:                              # 跌倒评分、时序历史和二值状态机配置
+  history_length: 120                       # 每个人最多保存的历史观测条数；必须覆盖确认和恢复所需时间
+  weights:                                  # 最终FallScore五项权重；总和应等于1
+    pose: 0.30                              # 姿态异常分数权重，包括人体角度和人框宽高比
+    height: 0.25                            # 髋部高度下降及绝对低高度分数权重
+    velocity: 0.20                          # 人体快速向下运动分数权重
+    static: 0.15                            # 异常姿态后持续静止分数权重
+    scene: 0.10                             # 地面、床、沙发等场景先验分数权重
+    
+  pose_score:                               # 姿态子分数参数
+    angle_normal_deg: 30.0                  # 角度小于等于该值时角度跌倒分数为0，单位度
+    angle_fall_deg: 60.0                    # 角度大于等于该值时角度跌倒分数为1，单位度
+    bbox_ratio_normal: 0.50                 # 人框宽/高不超过该值时框形状分数为0，通常表示竖直
+    bbox_ratio_fall: 0.90                   # 人框宽/高达到该值时框形状分数为1，通常表示横向躺倒
+    angle_weight: 0.70                      # 姿态子分数中角度占比；剩余0.30由人框宽高比提供
+  height_score:                             # 髋部高度下降和绝对高度子分数参数
+    baseline_window_s: 3.0                  # 从最近多少秒历史中估计跌倒前髋部基准高度，单位秒
+    min_baseline_age_s: 0.30                # 基准观测至少要早于当前多少秒，避免用同一瞬间比较，单位秒
+    drop_start_m: 0.15                      # 髋部比基准下降达到该值后开始增加下降分数，单位米
+    drop_full_m: 0.50                       # 髋部比基准下降达到该值后下降分数为1，单位米
+    hip_height_normal_m: 0.55               # 髋部高度达到或超过该值时绝对低高度分数为0，单位米
+    hip_height_fall_m: 0.25                 # 髋部高度达到或低于该值时绝对低高度分数为1，单位米
+  velocity_score:                           # 人体向下速度子分数参数
+    window_s: 0.35                          # 计算下降速度时向前查找的时间窗口，单位秒
+    min_interval_s: 0.15                    # 两个速度观测之间的最小时间间隔，单位秒；过近会放大深度噪声
+    normal_mps: 0.30                        # 向下速度不超过该值时速度分数为0，单位米/秒
+    fall_mps: 0.80                          # 向下速度达到该值时速度分数为1，单位米/秒
+    smoothing_alpha: 0.35                   # 速度指数平滑中新值占比，范围0~1；调大响应快但抖动也更明显
+  static_score:                             # 异常姿态后静止子分数参数
+    motion_window_s: 0.40                   # 计算人体移动速度使用的时间窗口，单位秒
+    min_interval_s: 0.20                    # 静止速度计算所需的最小时间间隔，单位秒
+    motion_threshold_mps: 0.12              # 人体速度低于该值时视为静止，单位米/秒
+    start_s: 1.0                            # 异常姿态后持续静止达到该时长才开始得分，单位秒
+    full_s: 3.0                             # 异常姿态后持续静止达到该时长时静止分数为1，单位秒
+    candidate_pose_score: 0.50              # 姿态分数至少达到该值才开始累计异常后静止时间
+    candidate_height_score: 0.50            # 高度分数至少达到该值才开始累计异常后静止时间
+  scene_scores:                             # 不同场景对跌倒的先验分数；越接近1越支持跌倒
+    floor: 1.0                              # 躺在地面强烈支持跌倒
+    bed: 0.0                                # 躺在床上通常属于正常行为，不提供跌倒分数
+    sofa: 0.1                               # 躺在沙发上通常正常，仅保留很低风险分数
+    chair: 0.0                              # 坐在椅子上通常正常，不提供跌倒分数
+    wheelchair: 0.0                         # 轮椅属于预留正常场景，当前Seg类别表未默认启用
+    unknown: 0.5                            # 场景无法确定时给中等分数，既不直接排除也不直接确认跌倒
+  state_machine:                            # 只对外输出FALL或NO_FALL的时序确认与恢复参数
+    trigger_score: 0.65                     # FallScore达到该值才进入跌倒候选计时，范围0~1
+    release_score: 0.35                     # 已确认跌倒后FallScore低于该值才允许开始恢复计时
+    confirm_duration_s: 1.0                 # 跌倒证据持续达到要求多久后确认FALL，单位秒
+    recover_duration_s: 2.0                 # 恢复证据持续满足多久后从FALL回到NO_FALL，单位秒
+    transient_evidence_hold_s: 3.0          # 快速下降等瞬态证据最多保留的时间，单位秒，避免后续静止阶段证据丢失
+    transient_height_score: 0.50            # 高度分数达到该值时记录一次可保留的下降证据
+    transient_velocity_score: 0.50          # 速度分数达到该值时记录一次可保留的快速运动证据
+    min_pose_score: 0.50                    # 确认FALL时姿态分数必须达到的最低值
+    min_height_score: 0.45                  # 确认FALL时当前或保留高度分数必须达到的最低值
+    min_data_quality: 0.45                  # 进入状态机的最低人体观测质量，范围0~1
+    recover_angle_deg: 30.0                 # 人体角度恢复到不超过该值才认为重新直立，单位度
+    recover_hip_height_m: 0.45              # 髋部离地高度恢复到不低于该值才认为重新站起，单位米
+    stale_person_s: 5.0                     # Track ID离开画面超过该时间后清空其全部历史，单位秒
+# 主画面显示
+display:                                    # OpenCV窗口和叠加信息显示配置
+  enabled: true                             # 是否打开实时可视化窗口；false适合无显示器后台运行
+  window_names:                             # 各模块单独运行时使用的窗口标题
+    body_angle: Body Angle Test              # body_angle.py在线角度测试窗口名称
+    sense: Person Scene Relation Test        # sense.py在线人物场景关系测试窗口名称
+    fall_detector: Fall Detector Test        # fall_detector.py在线评分和状态机测试窗口名称
+    full: Fall Detection Full Pipeline       # main.py完整跌倒检测流程窗口名称
+  show_keypoints: true                      # 是否绘制人体2D关键点；关闭可让画面更简洁
+  show_scene_objects: true                  # 是否绘制床、沙发和椅子的检测框及类别置信度
+  show_scene_masks: true                    # 是否用半透明颜色绘制家具实例分割Mask
+  scene_mask_alpha: 0.35                    # Mask覆盖透明度，范围0~1；越大颜色越明显但越遮挡原图
+  font_scale: 0.50                          # 主状态文字的OpenCV字体缩放系数
+  line_height_px: 18                        # 多行测量文字之间的垂直间距，单位像素
