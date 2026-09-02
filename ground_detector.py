@@ -16,6 +16,7 @@
   - 本版本地面模型使用 D2C 对齐后的 RGB 坐标系，
     后续人体 3D 与角度计算也必须使用同一 RGB 坐标系。
 """
+
 import os
 import time
 import yaml
@@ -24,27 +25,26 @@ import numpy as np
 
 from pyorbbecsdk import Pipeline, AlignFilter, OBStreamType
 
-
 # ============================================================
 # 配置参数
 # ============================================================
-NUM_FRAMES = 30                          # 连续采集帧数（用于中值融合）
-MIN_DEPTH_M = 0.30                       # 有效深度范围（米）
+NUM_FRAMES = 30  # 连续采集帧数（用于中值融合）
+MIN_DEPTH_M = 0.30  # 有效深度范围（米）
 MAX_DEPTH_M = 6.00
 
-ROI_Y_START = 0.35                       # 候选地面区域（图像下半部分，比例坐标）
+ROI_Y_START = 0.35  # 候选地面区域（图像下半部分，比例坐标）
 ROI_Y_END = 0.98
 ROI_X_START = 0.05
 ROI_X_END = 0.95
 
-RANSAC_ITERATIONS = 500                  # RANSAC 迭代次数
-RANSAC_SAMPLE_POINTS = 20000             # RANSAC 最多采样点数（提速）
-RANSAC_DISTANCE_THRESHOLD = 0.025        # 2.5cm 以内视为同一平面
+RANSAC_ITERATIONS = 500  # RANSAC 迭代次数
+RANSAC_SAMPLE_POINTS = 20000  # RANSAC 最多采样点数（提速）
+RANSAC_DISTANCE_THRESHOLD = 0.025  # 2.5cm 以内视为同一平面
 
-MIN_POINTS = 500                         # 最少有效点数量
-MIN_INLIER_RATIO = 0.70                  # 地面内点比例最低要求
-MAX_MEAN_ERROR_M = 0.020                 # 平面平均误差上限 20mm
-MAX_MAX_ERROR_M = 0.080                  # 最大误差上限 80mm
+MIN_POINTS = 500  # 最少有效点数量
+MIN_INLIER_RATIO = 0.70  # 地面内点比例最低要求
+MAX_MEAN_ERROR_M = 0.020  # 平面平均误差上限 20mm
+MAX_MAX_ERROR_M = 0.080  # 最大误差上限 80mm
 
 # 地面法向约束：RGB 坐标系 X右/Y下/Z前，水平地面法向量应主要沿 Y 方向
 GROUND_NORMAL_Y_MIN = 0.70
@@ -53,10 +53,10 @@ GROUND_NORMAL_Y_MIN = 0.70
 MIN_GROUND_HEIGHT_M = -0.30
 MAX_GROUND_HEIGHT_M = 2.00
 
-GROUND_FILE = "ground.yaml"              # 输出文件
-MAX_DRAW_INLIERS = 3000                  # 可视化最多绘制内点数（防 OpenCV 卡顿）
-MIN_FRAME_VALID_RATIO = 0.10             # 单帧至少 10% 像素有有效深度
-MAX_INVALID_FRAMES = 10                  # 连续采集时允许的无效帧上限
+GROUND_FILE = "ground.yaml"  # 输出文件
+MAX_DRAW_INLIERS = 3000  # 可视化最多绘制内点数（防 OpenCV 卡顿）
+MIN_FRAME_VALID_RATIO = 0.10  # 单帧至少 10% 像素有有效深度
+MAX_INVALID_FRAMES = 10  # 连续采集时允许的无效帧上限
 
 
 # ============================================================
@@ -82,10 +82,8 @@ def depth_to_points(depth_m, intrinsics):
     针孔模型：X=(u-cx)·Z/fx，Y=(v-cy)·Z/fy，Z 即深度。
     """
     h, w = depth_m.shape
-    fx, fy, cx, cy = (intrinsics["fx"], intrinsics["fy"],
-                      intrinsics["cx"], intrinsics["cy"])
-    u, v = np.meshgrid(np.arange(w, dtype=np.float32),
-                       np.arange(h, dtype=np.float32))
+    fx, fy, cx, cy = (intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"])
+    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     x = (u - cx) * depth_m / fx
     y = (v - cy) * depth_m / fy
     return np.stack([x, y, depth_m], axis=-1)
@@ -108,8 +106,9 @@ def select_ground_candidates(points):
     xyz = roi.reshape(-1, 3)
 
     # 与 3D 点一一对应的原图像素坐标
-    u_grid, v_grid = np.meshgrid(np.arange(x1, x2, dtype=np.int32),
-                                 np.arange(y1, y2, dtype=np.int32))
+    u_grid, v_grid = np.meshgrid(
+        np.arange(x1, x2, dtype=np.int32), np.arange(y1, y2, dtype=np.int32)
+    )
     uv = np.stack([u_grid, v_grid], axis=-1).reshape(-1, 2)
 
     # 删除 NaN/Inf
@@ -140,8 +139,7 @@ def plane_from_points(p1, p2, p3):
 def plane_distance(points, plane):
     """点到平面的距离；平面退化（法向模长≈0）时返回 inf。"""
     A, B, C, D = plane
-    numerator = np.abs(A * points[:, 0] + B * points[:, 1]
-                       + C * points[:, 2] + D)
+    numerator = np.abs(A * points[:, 0] + B * points[:, 1] + C * points[:, 2] + D)
     denominator = np.sqrt(A * A + B * B + C * C)
     if denominator < 1e-8:
         return np.full(len(points), np.inf, dtype=np.float64)
@@ -202,8 +200,7 @@ def ransac_plane(points):
 
     # 采样：控制参与迭代的点数
     if num_points > RANSAC_SAMPLE_POINTS:
-        sample_points = points[rng.choice(num_points, size=RANSAC_SAMPLE_POINTS,
-                                          replace=False)]
+        sample_points = points[rng.choice(num_points, size=RANSAC_SAMPLE_POINTS, replace=False)]
     else:
         sample_points = points
     sample_num = len(sample_points)
@@ -211,22 +208,23 @@ def ransac_plane(points):
     best_plane, best_count = None, 0
     for _ in range(RANSAC_ITERATIONS):
         ids = rng.choice(sample_num, size=3, replace=False)
-        plane = plane_from_points(sample_points[ids[0]], sample_points[ids[1]],
-                                  sample_points[ids[2]])
+        plane = plane_from_points(
+            sample_points[ids[0]], sample_points[ids[1]], sample_points[ids[2]]
+        )
         if plane is None:
             continue
         # 法向约束：先定向再检查 |normal_y|，快速排除墙面
         plane = orient_ground_plane(plane)
         if abs(plane[1]) < GROUND_NORMAL_Y_MIN:
             continue
-        count = int(np.sum(plane_distance(sample_points, plane)
-                           < RANSAC_DISTANCE_THRESHOLD))
+        count = int(np.sum(plane_distance(sample_points, plane) < RANSAC_DISTANCE_THRESHOLD))
         if count > best_count:
             best_count, best_plane = count, plane
 
     if best_plane is None:
-        raise RuntimeError("RANSAC 没有找到符合地面方向约束的平面。\n"
-                           "请检查 ROI、相机视角和地面区域。")
+        raise RuntimeError(
+            "RANSAC 没有找到符合地面方向约束的平面。\n" "请检查 ROI、相机视角和地面区域。"
+        )
 
     # 用全部点重算内点
     best_plane = orient_ground_plane(best_plane)
@@ -263,20 +261,31 @@ def check_ground_quality(plane, points, inlier_mask):
     valid_ratio = len(inliers) / len(points)
 
     if inlier_ratio < MIN_INLIER_RATIO:
-        raise RuntimeError(f"地面内点比例过低：{inlier_ratio * 100:.2f}%\n"
-                           "建议扩大 ROI 或移除桌面/床面/墙面等干扰物。")
+        raise RuntimeError(
+            f"地面内点比例过低：{inlier_ratio * 100:.2f}%\n"
+            "建议扩大 ROI 或移除桌面/床面/墙面等干扰物。"
+        )
     if mean_error > MAX_MEAN_ERROR_M:
-        raise RuntimeError(f"地面平均误差过大：{mean_error * 1000:.2f} mm\n"
-                           "建议检查 Depth 质量、地面平整度或 RANSAC 阈值。")
+        raise RuntimeError(
+            f"地面平均误差过大：{mean_error * 1000:.2f} mm\n"
+            "建议检查 Depth 质量、地面平整度或 RANSAC 阈值。"
+        )
     if max_error > MAX_MAX_ERROR_M:
-        raise RuntimeError(f"地面最大误差过大：{max_error * 1000:.2f} mm\n"
-                           "说明存在较明显的局部深度异常或非平面点。")
+        raise RuntimeError(
+            f"地面最大误差过大：{max_error * 1000:.2f} mm\n"
+            "说明存在较明显的局部深度异常或非平面点。"
+        )
     if normal_y < GROUND_NORMAL_Y_MIN:
         raise RuntimeError(f"地面法向量方向异常：|normal_y|={normal_y:.3f}")
 
-    return {"inlier_ratio": float(inlier_ratio), "mean_error": mean_error,
-            "max_error": max_error, "normal_y": float(normal_y),
-            "tilt_deg": float(tilt_deg), "valid_ratio": float(valid_ratio)}
+    return {
+        "inlier_ratio": float(inlier_ratio),
+        "mean_error": mean_error,
+        "max_error": max_error,
+        "normal_y": float(normal_y),
+        "tilt_deg": float(tilt_deg),
+        "valid_ratio": float(valid_ratio),
+    }
 
 
 # ============================================================
@@ -291,9 +300,12 @@ def save_ground_plane(plane, intrinsics, inlier_count, total_count, quality):
         "plane": {"A": float(A), "B": float(B), "C": float(C), "D": float(D)},
         "normal": {"x": float(A), "y": float(B), "z": float(C)},
         "camera_intrinsics": {
-            "width": int(intrinsics["width"]), "height": int(intrinsics["height"]),
-            "fx": float(intrinsics["fx"]), "fy": float(intrinsics["fy"]),
-            "cx": float(intrinsics["cx"]), "cy": float(intrinsics["cy"]),
+            "width": int(intrinsics["width"]),
+            "height": int(intrinsics["height"]),
+            "fx": float(intrinsics["fx"]),
+            "fy": float(intrinsics["fy"]),
+            "cx": float(intrinsics["cx"]),
+            "cy": float(intrinsics["cy"]),
         },
         "ransac": {
             "distance_threshold_m": float(RANSAC_DISTANCE_THRESHOLD),
@@ -335,8 +347,7 @@ def depth_to_display(depth_m, h, w):
     valid = np.isfinite(display)
     normalized = np.clip(display / MAX_DEPTH_M, 0, 1)
     normalized[~valid] = 0
-    depth_img = cv2.applyColorMap((normalized * 255).astype(np.uint8),
-                                  cv2.COLORMAP_JET)
+    depth_img = cv2.applyColorMap((normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
     if not np.any(valid):
         depth_img = np.zeros((h, w, 3), dtype=np.uint8)
     return depth_img
@@ -348,8 +359,7 @@ def draw_ground_overlay(image, candidate_uv, inlier_mask):
     if len(inlier_uv) == 0:
         return
     if len(inlier_uv) > MAX_DRAW_INLIERS:
-        ids = np.random.default_rng().choice(len(inlier_uv),
-                                             size=MAX_DRAW_INLIERS, replace=False)
+        ids = np.random.default_rng().choice(len(inlier_uv), size=MAX_DRAW_INLIERS, replace=False)
         inlier_uv = inlier_uv[ids]
     for u, v in inlier_uv:
         cv2.circle(image, (int(u), int(v)), 1, (0, 255, 0), -1)
@@ -401,9 +411,14 @@ def main():
 
         # ---- 4. 自动读取 RGB 内参（点云/人体 3D 都用它）----
         rgb = pipeline.get_camera_param().rgb_intrinsic
-        intrinsics = {"width": int(rgb.width), "height": int(rgb.height),
-                      "fx": float(rgb.fx), "fy": float(rgb.fy),
-                      "cx": float(rgb.cx), "cy": float(rgb.cy)}
+        intrinsics = {
+            "width": int(rgb.width),
+            "height": int(rgb.height),
+            "fx": float(rgb.fx),
+            "fy": float(rgb.fy),
+            "cx": float(rgb.cx),
+            "cy": float(rgb.cy),
+        }
         print("\n[4] RGB 内参")
         print(f"分辨率：{intrinsics['width']} x {intrinsics['height']}")
         print(f"fx = {intrinsics['fx']:.6f}  fy = {intrinsics['fy']:.6f}")
@@ -444,8 +459,11 @@ def main():
 
             depth_frames.append(depth_m)
             invalid_count = 0
-            print(f"\r采集进度：{len(depth_frames)}/{NUM_FRAMES}"
-                  f"  Depth 有效率：{valid_ratio * 100:.1f}%", end="")
+            print(
+                f"\r采集进度：{len(depth_frames)}/{NUM_FRAMES}"
+                f"  Depth 有效率：{valid_ratio * 100:.1f}%",
+                end="",
+            )
         print()
 
         # ---- 6. 多帧中值融合（至少 2 帧有效的像素才保留）----
@@ -470,10 +488,12 @@ def main():
         ground_points, candidate_uv = select_ground_candidates(points)
         print(f"候选点数量：{len(ground_points)}")
         if len(ground_points) < MIN_POINTS:
-            raise RuntimeError("候选地面点太少，请检查：\n"
-                               "1. 相机是否能看到地面\n"
-                               "2. Depth 是否正常\n"
-                               "3. ROI 是否合适")
+            raise RuntimeError(
+                "候选地面点太少，请检查：\n"
+                "1. 相机是否能看到地面\n"
+                "2. Depth 是否正常\n"
+                "3. ROI 是否合适"
+            )
 
         # ---- 9. RANSAC 拟合 ----
         print("\n[9] RANSAC 拟合地面...")
@@ -505,16 +525,19 @@ def main():
         print("\n[11] 显示地面检测结果")
         depth_img = depth_to_display(depth_median, intrinsics["height"], intrinsics["width"])
         draw_ground_overlay(depth_img, candidate_uv, inlier_mask)  # 绿色内点
-        draw_roi(depth_img)                                        # ROI 框
+        draw_roi(depth_img)  # ROI 框
 
-        for text, y in ((f"Inlier: {quality['inlier_ratio'] * 100:.1f}%", 30),
-                        (f"Mean Error: {quality['mean_error'] * 1000:.1f}mm", 60),
-                        (f"Max Error: {quality['max_error'] * 1000:.1f}mm", 90),
-                        (f"NormalY: {quality['normal_y']:.2f}", 120),
-                        (f"Tilt: {quality['tilt_deg']:.1f}deg", 150),
-                        ("GREEN = GROUND", 180)):
-            cv2.putText(depth_img, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65, (255, 255, 255), 2)
+        for text, y in (
+            (f"Inlier: {quality['inlier_ratio'] * 100:.1f}%", 30),
+            (f"Mean Error: {quality['mean_error'] * 1000:.1f}mm", 60),
+            (f"Max Error: {quality['max_error'] * 1000:.1f}mm", 90),
+            (f"NormalY: {quality['normal_y']:.2f}", 120),
+            (f"Tilt: {quality['tilt_deg']:.1f}deg", 150),
+            ("GREEN = GROUND", 180),
+        ):
+            cv2.putText(
+                depth_img, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2
+            )
 
         print("\n可视化说明：")
         print("绿色点 = RANSAC 最终认定的地面点")

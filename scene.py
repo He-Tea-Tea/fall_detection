@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""人与场景关系识别模块（sense）。
+"""场景关系与场景风险评分模块（scene）。
 
 职责边界
 --------
@@ -11,9 +11,9 @@
 * lying_on_floor：人体水平且髋部接近地面，属于高风险场景；
 * unknown：证据不足。
 
-输入来自main.py：人体框、人体3D关键点、body_angle.py输出的角度、YOLO-Seg
+输入来自main.py：人体框、人体3D关键点、pose_3D.py输出的角度、YOLO-Seg
 检测到的家具框和Mask、D2C深度及RGB内参。家具3D点只从Mask与承载表面区域
-的交集采样，减少矩形框内墙壁、地面等背景Depth干扰。本模块不计算跌倒分数。
+的交集采样，减少背景Depth干扰；最后把关系映射为0～1的scene风险分。
 """
 
 import argparse
@@ -31,6 +31,7 @@ RIGHT_SHOULDER = 6
 LEFT_HIP = 11
 RIGHT_HIP = 12
 
+
 @dataclass
 class SceneObjectDetection:
     """YOLO-Seg家具结果；bbox和mask均已映射到RGB原图坐标。"""
@@ -39,6 +40,7 @@ class SceneObjectDetection:
     confidence: float
     bbox: np.ndarray
     mask: np.ndarray
+
 
 @dataclass
 class SceneObjectGeometry:
@@ -53,6 +55,7 @@ class SceneObjectGeometry:
     mask_area_px: int
     sampled_point_count: int
 
+
 @dataclass
 class SceneRelationResult:
     """一人与场景的最终关系。"""
@@ -61,6 +64,7 @@ class SceneRelationResult:
     relation: str
     scene_name: str
     confidence: float
+    scene_score: float
     object_name: Optional[str]
     iou: float
     nearest_distance_m: Optional[float]
@@ -68,10 +72,12 @@ class SceneRelationResult:
     object_surface_height_m: Optional[float]
     reason: str
 
+
 def load_config(path: str) -> dict:
     """读取统一config.yaml。"""
     with open(path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file) or {}
+
 
 def load_ground_plane(path: str) -> np.ndarray:
     """读取并归一化ground.yaml中的[A,B,C,D]。"""
@@ -86,6 +92,7 @@ def load_ground_plane(path: str) -> np.ndarray:
         raise ValueError("地面法向量无效")
     return plane / normal_norm
 
+
 def bbox_iou(first: Sequence[float], second: Sequence[float]) -> float:
     """计算两个[x1,y1,x2,y2]框的二维交并比。"""
     ax1, ay1, ax2, ay2 = map(float, first)
@@ -98,12 +105,13 @@ def bbox_iou(first: Sequence[float], second: Sequence[float]) -> float:
     union = area_a + area_b - intersection
     return 0.0 if union <= 1e-8 else float(intersection / union)
 
-class SceneRelationDetector:
+
+class SceneScorer:
     """将人体姿态、家具3D几何和地面高度融合为稳定场景关系。"""
 
     def __init__(self, config: dict, ground_plane: Sequence[float]):
         """读取关系阈值和Depth范围，归一化地面平面并建立每个人的关系历史。"""
-        scene_cfg = config["sense"]
+        scene_cfg = config["scene"]
         depth_cfg = config["depth"]
         self.class_map = dict(scene_cfg["target_class_map"])
         self.sample_step = int(scene_cfg["object_sample_step"])
@@ -115,6 +123,7 @@ class SceneRelationDetector:
         self.relation_cfg = dict(scene_cfg["relation"])
         self.confidence_threshold = float(scene_cfg["confidence_threshold"])
         self.history_length = int(scene_cfg["history_length"])
+        self.risk_scores = dict(scene_cfg["risk_scores"])
         self.min_depth_m = float(depth_cfg["min_depth_m"])
         self.max_depth_m = float(depth_cfg["max_depth_m"])
 
@@ -142,7 +151,12 @@ class SceneRelationDetector:
             return None
         return (points[left] + points[right]) / 2.0
 
-    def _object_geometry(self, detection: SceneObjectDetection, depth_m: np.ndarray, intrinsics: dict,) -> Optional[SceneObjectGeometry]:
+    def _object_geometry(
+        self,
+        detection: SceneObjectDetection,
+        depth_m: np.ndarray,
+        intrinsics: dict,
+    ) -> Optional[SceneObjectGeometry]:
         """只在家具Mask与承载表面区域的交集中采样Depth并转换为3D点集。"""
         name = detection.name
         if name not in self.surface_bands:
@@ -206,7 +220,9 @@ class SceneRelationDetector:
         differences = person_points[:, None, :] - object_points[None, :, :]
         return float(np.min(np.linalg.norm(differences, axis=2)))
 
-    def _relation_confidence(self, iou: float, distance_m: Optional[float], height_gap_m: Optional[float]) -> float:
+    def _relation_confidence(
+        self, iou: float, distance_m: Optional[float], height_gap_m: Optional[float]
+    ) -> float:
         """把2D重叠、3D距离和表面高度差归一化为关系可信度。"""
         cfg = self.relation_cfg
         min_iou = float(cfg["min_iou"])
@@ -224,9 +240,7 @@ class SceneRelationDetector:
             if height_gap_m is None
             else float(
                 np.clip(
-                    1.0
-                    - height_gap_m
-                    / max(float(cfg["surface_height_tolerance_m"]), 1e-8),
+                    1.0 - height_gap_m / max(float(cfg["surface_height_tolerance_m"]), 1e-8),
                     0.0,
                     1.0,
                 )
@@ -258,12 +272,22 @@ class SceneRelationDetector:
         for obj in objects:
             iou = bbox_iou(person_bbox, obj.bbox)
             nearest = self._nearest_distance(person_points_3d, obj.points_3d)
-            height_gap = (None if hip_height_m is None else abs(float(hip_height_m) - float(obj.surface_height_m)))
+            height_gap = (
+                None
+                if hip_height_m is None
+                else abs(float(hip_height_m) - float(obj.surface_height_m))
+            )
             # 几何关系置信度再乘家具Seg置信度，低可信Mask不能产生高可信场景关系。
-            confidence = self._relation_confidence(iou, nearest, height_gap) * float(np.clip(obj.confidence, 0.0, 1.0))
-            has_contact = iou >= float(cfg["min_iou"]) or (nearest is not None and nearest <= float(cfg["on_distance_m"]))
+            confidence = self._relation_confidence(iou, nearest, height_gap) * float(
+                np.clip(obj.confidence, 0.0, 1.0)
+            )
+            has_contact = iou >= float(cfg["min_iou"]) or (
+                nearest is not None and nearest <= float(cfg["on_distance_m"])
+            )
             near_object = nearest is not None and nearest <= float(cfg["near_distance_m"])
-            surface_match = (height_gap is not None and height_gap <= float(cfg["surface_height_tolerance_m"]))
+            surface_match = height_gap is not None and height_gap <= float(
+                cfg["surface_height_tolerance_m"]
+            )
 
             relation: Optional[str] = None
             if (
@@ -274,9 +298,18 @@ class SceneRelationDetector:
                 and surface_match
             ):
                 relation = f"lying_on_{obj.name}"
-            elif (body_angle_deg is not None and body_angle_deg <= float(cfg["standing_angle_max_deg"]) and has_contact and surface_match):
+            elif (
+                body_angle_deg is not None
+                and body_angle_deg <= float(cfg["standing_angle_max_deg"])
+                and has_contact
+                and surface_match
+            ):
                 relation = f"sitting_on_{obj.name}"
-            elif (body_angle_deg is not None and body_angle_deg <= float(cfg["standing_angle_max_deg"]) and near_object):
+            elif (
+                body_angle_deg is not None
+                and body_angle_deg <= float(cfg["standing_angle_max_deg"])
+                and near_object
+            ):
                 relation = f"standing_near_{obj.name}"
 
             if relation is None:
@@ -286,6 +319,7 @@ class SceneRelationDetector:
                 relation=relation,
                 scene_name=obj.name,
                 confidence=confidence,
+                scene_score=float(self.risk_scores.get(obj.name, self.risk_scores["unknown"])),
                 object_name=obj.name,
                 iou=iou,
                 nearest_distance_m=nearest,
@@ -311,7 +345,13 @@ class SceneRelationDetector:
                     1.0,
                 )
             )
-            height_score = float(np.clip(1.0 - hip_height_m / max(float(cfg["floor_hip_height_m"]), 1e-8), 0.0, 1.0,))
+            height_score = float(
+                np.clip(
+                    1.0 - hip_height_m / max(float(cfg["floor_hip_height_m"]), 1e-8),
+                    0.0,
+                    1.0,
+                )
+            )
             floor_weights = cfg["floor_confidence_weights"]
             best = SceneRelationResult(
                 person_id=int(person_id),
@@ -321,6 +361,7 @@ class SceneRelationDetector:
                     float(floor_weights["angle"]) * angle_score
                     + float(floor_weights["height"]) * height_score
                 ),
+                scene_score=float(self.risk_scores["floor"]),
                 object_name=None,
                 iou=0.0,
                 nearest_distance_m=None,
@@ -335,6 +376,7 @@ class SceneRelationDetector:
                 relation="unknown",
                 scene_name="unknown",
                 confidence=0.0,
+                scene_score=float(self.risk_scores["unknown"]),
                 object_name=None,
                 iou=0.0,
                 nearest_distance_m=None,
@@ -359,7 +401,14 @@ class SceneRelationDetector:
         selected = latest[relation]
         stable_confidence = totals[relation] / max(counts[relation], 1)
         if stable_confidence < self.confidence_threshold and relation != "unknown":
-            return replace(selected, relation="unknown", scene_name="unknown", confidence=stable_confidence, reason="场景关系尚未达到稳定置信度",)
+            return replace(
+                selected,
+                relation="unknown",
+                scene_name="unknown",
+                confidence=stable_confidence,
+                scene_score=float(self.risk_scores["unknown"]),
+                reason="场景关系尚未达到稳定置信度",
+            )
         return replace(selected, confidence=float(np.clip(stable_confidence, 0.0, 1.0)))
 
     def analyze(
@@ -377,7 +426,10 @@ class SceneRelationDetector:
         hip = self._pair_center(points, LEFT_HIP, RIGHT_HIP)
         hip_height = self.point_ground_height(hip)
         person_indices = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
-        person_points = np.asarray([points[index] for index in person_indices if np.all(np.isfinite(points[index]))], dtype=np.float32,)
+        person_points = np.asarray(
+            [points[index] for index in person_indices if np.all(np.isfinite(points[index]))],
+            dtype=np.float32,
+        )
         if person_points.size == 0:
             person_points = np.empty((0, 3), dtype=np.float32)
 
@@ -400,9 +452,13 @@ class SceneRelationDetector:
         """清理离开画面的Track ID场景历史。"""
         self.histories.pop(int(person_id), None)
 
+
+SceneRelationDetector = SceneScorer  # 兼容旧代码中的类名，新主流程使用SceneScorer。
+
+
 def run_self_test(config: dict) -> None:
     """用合成Mask和测量验证家具取深度及三类人物关系。"""
-    detector = SceneRelationDetector(config, [0.0, -1.0, 0.0, 1.0])
+    detector = SceneScorer(config, [0.0, -1.0, 0.0, 1.0])
     mask = np.zeros((100, 100), dtype=bool)
     mask[20:70, 15:85] = True
     depth_m = np.full((100, 100), 5.0, dtype=np.float32)
@@ -411,7 +467,10 @@ def run_self_test(config: dict) -> None:
     detection = SceneObjectDetection("bed", 0.9, np.array([10, 10, 90, 90], dtype=np.float32), mask)
     geometry = detector._object_geometry(detection, depth_m, intrinsics)
     assert geometry is not None and np.allclose(geometry.points_3d[:, 2], 2.0)
-    assert geometry.mask_area_px == int(np.count_nonzero(mask)) and geometry.sampled_point_count >= detector.min_object_points
+    assert (
+        geometry.mask_area_px == int(np.count_nonzero(mask))
+        and geometry.sampled_point_count >= detector.min_object_points
+    )
 
     person_points = np.array([[0.0, 0.4, 2.0]], dtype=np.float32)
     bed = SceneObjectGeometry(
@@ -425,10 +484,18 @@ def run_self_test(config: dict) -> None:
         sampled_point_count=80,
     )
     result = detector.classify_measurements(1, [30, 30, 170, 180], person_points, 80.0, 0.55, [bed])
-    assert result.relation == "lying_on_bed" and result.scene_name == "bed"
+    assert (
+        result.relation == "lying_on_bed"
+        and result.scene_name == "bed"
+        and result.scene_score == 0.0
+    )
 
     result = detector.classify_measurements(2, [30, 30, 170, 180], person_points, 80.0, 0.10, [])
-    assert result.relation == "lying_on_floor" and result.scene_name == "floor"
+    assert (
+        result.relation == "lying_on_floor"
+        and result.scene_name == "floor"
+        and result.scene_score == 1.0
+    )
 
     chair = SceneObjectGeometry(
         name="chair",
@@ -440,16 +507,23 @@ def run_self_test(config: dict) -> None:
         mask_area_px=500,
         sampled_point_count=40,
     )
-    result = detector.classify_measurements(3, [30, 30, 170, 180], person_points, 10.0, 0.90, [chair])
+    result = detector.classify_measurements(
+        3, [30, 30, 170, 180], person_points, 10.0, 0.90, [chair]
+    )
     assert result.relation == "standing_near_chair"
 
-    print("sense self-test: PASS")
-    print("  mask-only depth, lying_on_bed, lying_on_floor, standing_near_chair=PASS")
+    print("scene self-test: PASS")
+    print("  mask depth, relation recognition, scene risk score=PASS")
+
 
 def main() -> None:
     """命令行独立测试入口；默认打开相机，--self-test无需硬件。"""
     parser = argparse.ArgumentParser(description="人与场景关系识别模块")
-    parser.add_argument("--config", default=str(Path(__file__).resolve().parent / "config.yaml"), help="统一配置文件路径",)
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "config.yaml"),
+        help="统一配置文件路径",
+    )
     parser.add_argument("--self-test", action="store_true", help="运行合成数据测试")
     args = parser.parse_args()
     config = load_config(args.config)
@@ -459,7 +533,8 @@ def main() -> None:
         # 延迟导入可避免算法模块依赖相机SDK；只有在线测试时才加载主流程。
         from main import run_live
 
-        run_live(config, args.config, stage="sense")
+        run_live(config, args.config, stage="scene")
+
 
 if __name__ == "__main__":
     main()
