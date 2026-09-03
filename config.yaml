@@ -11,6 +11,7 @@ models:                                     # YOLO模型与推理参数
   scene_retina_masks: true                  # 是否输出精细Mask；true边缘更准但稍占显存
   tracker: botsort.yaml                     # 人体跟踪器，用于保持稳定Track ID
   scene_inference_interval_frames: 3        # 每隔多少帧运行一次家具Seg，调大更省算力
+
 camera:                                     # RGB-D取帧与标定一致性检查
   frame_timeout_ms: 1000                    # 正常运行等待一组帧的最长时间，单位毫秒
   first_frame_timeout_ms: 3000              # 启动时每次等待首帧的最长时间，单位毫秒
@@ -18,11 +19,13 @@ camera:                                     # RGB-D取帧与标定一致性检�
   strict_ground_calibration: true           # 内参与标定不一致时是否禁止运行
   focal_relative_tolerance: 0.02            # fx/fy允许相对误差，0.02表示2%
   principal_point_tolerance_px: 5.0         # cx/cy允许误差，单位像素
+
 depth:                                      # 深度与3D反投影
   min_depth_m: 0.30                         # 最小有效深度，单位米
   max_depth_m: 6.00                         # 最大有效深度，单位米
   window_size: 5                            # 关键点深度中值窗口边长，必须为正奇数
   min_valid_samples: 3                      # 窗口内最少有效深度像素数
+
 pose:                                       # 人体基础观测质量，不是姿态评分
   min_keypoint_conf: 0.50                   # 2D关键点参与3D反投影的最低置信度
   min_valid_3d_keypoints: 4                 # 可靠人体至少需要的3D关键点数量
@@ -37,6 +40,7 @@ pose:                                       # 人体基础观测质量，不是�
     torso_coverage: 0.20                    # 肩部和髋部完整度权重
     person_size: 0.10                       # 人框尺寸权重
     distance: 0.05                          # 人与相机距离权重
+
 pose_3d:                                    # pose_3D.py的三维人体角度
   min_keypoint_conf: 0.50                   # 3D肩/髋/膝/踝参与计算的最低Pose置信度
   history_length: 7                         # 3D角度中值滤波帧数
@@ -44,6 +48,7 @@ pose_3d:                                    # pose_3D.py的三维人体角度
   allow_lower_body_fallback: true           # 肩部缺失时是否用髋到膝/踝回退计算
   angle_normal_deg: 30.0                    # 3D角度不超过此值时P3D为0；0°表示竖直
   angle_fall_deg: 60.0                      # 3D角度达到此值时P3D为1；90°表示水平
+
 pose_2d:                                    # pose_2D.py：二维角度、人框比例与P2D子分
   min_keypoint_conf: 0.50                   # 2D肩/髋关键点最低置信度
   min_image_vector_length_px: 20.0          # 2D肩中心到髋中心连线最小长度，单位像素
@@ -54,10 +59,12 @@ pose_2d:                                    # pose_2D.py：二维角度、人框
   weights:                                  # P2D内部两项权重，总和必须等于1
     image_angle: 0.636364                   # 二维角度在P2D中的权重
     bbox_ratio: 0.363636                    # 人框宽高比在P2D中的权重
+
 pose_fusion:                                # 姿态维度P只融合两个已经算好的独立子分
   weights:                                  # P3D与P2D融合权重，总和必须等于1
     pose_3d: 0.45                           # 三维姿态子分P3D权重
     pose_2d: 0.55                           # 二维姿态子分P2D权重；保持原二维角度35%+人框20%
+
 height_score:                               # height.py：高度维度H
   history_length: 120                       # 每个人最多保存的髋高历史条数
   baseline_window_s: 3.0                    # 最近多少秒用于寻找跌倒前最高髋高
@@ -66,6 +73,7 @@ height_score:                               # height.py：高度维度H
   drop_full_m: 0.50                         # 髋部下降达到该值记满分，单位米
   hip_height_normal_m: 0.55                 # 当前髋高达到该值时低高度分为0
   hip_height_fall_m: 0.25                   # 当前髋高低于该值时低高度分为1
+
 velocity_score:                             # velocity.py：下降速度维度V
   history_length: 30                        # 每个人最多保存的短时髋高历史条数
   window_s: 0.35                            # 计算垂直速度的回看窗口，单位秒
@@ -73,6 +81,7 @@ velocity_score:                             # velocity.py：下降速度维度V
   normal_mps: 0.30                          # 向下速度不超过该值时风险为0，单位米/秒
   fall_mps: 0.80                            # 向下速度达到该值时风险为1，单位米/秒
   smoothing_alpha: 0.35                     # 速度平滑中新值占比，调大响应更快但更抖
+
 static_score:                               # static.py：异常后静止维度S
   history_length: 30                        # 每个人最多保存的躯干中心历史条数
   motion_window_s: 0.40                     # 计算躯干3D速度的回看窗口，单位秒
@@ -82,6 +91,7 @@ static_score:                               # static.py：异常后静止维度S
   full_s: 3.0                               # 异常后静止达到该时间记满分
   candidate_pose_score: 0.50                # P达到该值才允许累计静止时间
   candidate_height_score: 0.50              # H达到该值才允许累计静止时间
+
 scene:                                      # scene.py：人物场景关系与场景维度C
   target_class_map:                         # 模型类别名到系统场景名的映射
     bed: bed                                # 床
@@ -122,6 +132,7 @@ scene:                                      # scene.py：人物场景关系与�
     chair: 0.0                              # 坐在或靠近椅子
     wheelchair: 0.0                         # 预留轮椅场景
     unknown: 0.5                            # 场景无法确定
+
 fall_detector:                              # fall_detector.py：只做五项加权和二值状态机
   history_length: 120                       # 每个人保存的总分历史条数
   weights:                                  # FallScore五项权重，总和必须等于1
@@ -143,7 +154,15 @@ fall_detector:                              # fall_detector.py：只做五项加
     min_data_quality: 0.45                  # 进入状态机的最低人体数据质量
     recover_angle_deg: 30.0                 # 3D人体角度恢复到该值以下才视为直立
     recover_hip_height_m: 0.45              # 髋高恢复到该值以上才视为站起
+    allow_2d_only_fall: true                # Depth完全失效时，是否允许只靠P2D继续确认跌倒
+    degraded_min_available_weight: 0.30     # 降级判断至少要有多少原始维度权重，0.30允许只有P
+    degraded_min_pose_score: 0.85           # 纯2D降级确认所需最低姿态风险，比普通模式更严格
+    degraded_trigger_score: 0.80            # 有效维度重新归一化后，降级总分触发阈值
+    degraded_confirm_duration_s: 2.0        # 纯2D高风险连续多久才确认FALL，单位秒
+    degraded_recover_pose_score: 0.25       # 3D仍缺失时，P2D低于该值才允许解除FALL
+    degraded_recover_duration_s: 3.0        # 纯2D恢复证据连续多久才解除FALL，单位秒
     stale_person_s: 5.0                     # ID离开画面后清空全部历史的时间
+
 display:                                    # OpenCV可视化
   enabled: true                             # 是否打开窗口
   window_names:                             # 各文件单独测试的窗口标题
