@@ -1,4 +1,4 @@
-# 跌倒检测新版项目结构与判断逻辑
+# 跌倒检测新版项目结构、本地判断与AI复核逻辑
 
 ## 1. 先理解“五维、六个特征文件”
 
@@ -30,6 +30,10 @@ flowchart TD
     B --> F[height/velocity/static/scene输出H/V/S/C]
     E --> G[fall_detector二值判断]
     F --> G
+    G --> H[ai_verifier事件触发复核]
+    G --> I[decision_fusion最终判断]
+    H --> I
+    I --> J[alert_manager告警事件]
 ```
 
 程序的实际执行顺序是：
@@ -41,6 +45,9 @@ flowchart TD
 5. 六个特征文件分别计算`P3D、P2D、H、V、S、C`。
 6. `P3D`和`P2D`融合为五维中的姿态分`P`。
 7. `fall_detector.py`加权`P/H/V/S/C`，只输出`FALL`或`NO_FALL`。
+8. 本地结果达到疑似阈值时，`ai_verifier.py`异步提交短时序列给豆包。
+9. `decision_fusion.py`组合本地状态和有效期内的AI结果。
+10. 最终状态变化由`alert_manager.py`转换成可扩展的告警事件。
 
 ## 3. 每个文件到底负责什么
 
@@ -54,6 +61,9 @@ flowchart TD
 | `static.py` | Track ID、时间、躯干3D中心、`P/H` | 异常后的静止时间 | `StaticScoreResult`和`S` |
 | `scene.py` | 人体几何、3D角度、家具Mask和Depth | 人与家具/地面的关系 | `SceneRelationResult`和`C` |
 | `fall_detector.py` | `P/H/V/S/C`和恢复所需测量 | 总分、确认和恢复 | `FallDecision` |
+| `ai_verifier.py` | 本地时间序列、可选多帧JPEG | 事件缓冲、后台API请求、JSON解析和网络退避 | `AIVerificationResult` |
+| `decision_fusion.py` | 本地结果和AI复核结果 | 本地优先、AI辅助确认和结果保持 | `FusionDecision` |
+| `alert_manager.py` | 最终融合结果 | 检测状态变化并调用告警处理器 | `AlertEvent` |
 | `main.py` | 配置、相机和模型 | 组织完整调用顺序和显示 | 实时窗口 |
 | `config.yaml` | 人工设置 | 集中保存所有可调参数 | 配置字典 |
 
@@ -385,6 +395,8 @@ FallScore = 0.30P + 0.25H + 0.20V + 0.15S + 0.10C
 | `C / relation / conf` | 场景分、人物场景关系、关系置信度 |
 | `FallScore` | 五维最终加权分 |
 | `FALL / NO_FALL` | 二值状态机输出 |
+| `AI / conf / input` | AI状态、置信度和DATA或VISION输入模式 |
+| `FINAL / source` | 融合后的最终状态及LOCAL、LOCAL+AI或AI_ASSISTED来源 |
 
 ## 13. 单独测试和完整运行
 
@@ -398,6 +410,9 @@ python velocity.py --self-test
 python static.py --self-test
 python scene.py --self-test
 python fall_detector.py --self-test
+python ai_verifier.py --self-test
+python decision_fusion.py --self-test
+python alert_manager.py --self-test
 python main.py --self-test
 ```
 
@@ -411,6 +426,7 @@ python velocity.py
 python static.py
 python scene.py
 python fall_detector.py
+python ai_verifier.py
 ```
 
 完整运行：
@@ -429,6 +445,7 @@ python main.py --stage velocity
 python main.py --stage static
 python main.py --stage scene
 python main.py --stage fall_detector
+python main.py --stage ai
 python main.py --stage full
 ```
 
@@ -446,3 +463,21 @@ python main.py --stage full
 - 相机支架受到碰撞或松动。
 
 只要相机安装姿态和内参没有变化，就不需要每次启动程序都重新标定。
+
+## 15. 当前豆包AI判断逻辑
+
+当前配置使用`doubao-1-5-pro-32k-250115`。该模型属于文本模型，不能直接理解图片，因此当前AI收到的是最近5秒内选出的多个时间点，包括本地总分、`P/H/V/S/C`、有效维度、2D/3D角度、髋高、垂直速度、静止时间和场景关系。
+
+AI不是固定每秒调用。只有本地总分、姿态分和数据质量连续达到`config.yaml`中的触发条件，或者本地已经确认`FALL`时，才创建后台请求。同一人员请求之间有冷却时间；网络失败后采用指数退避；API密钥缺失、请求超时、解析失败或AI输出`UNCERTAIN`时，本地状态机照常运行。
+
+最终融合遵守以下顺序：
+
+1. 本地已经确认`FALL`：立即输出`FALL`，AI不能否决。
+2. 本地处于中高风险但尚未确认：高置信度AI可辅助确认`FALL`。
+3. 文本AI只使用本地数据，因此要求的本地最低总分高于视觉AI。
+4. AI返回`NO_FALL`：只能作为复核信息，不能解除本地已确认报警。
+5. AI不可用：最终结果自动等于本地结果。
+
+代码已经预留视觉模式。以后换成支持图片的模型或推理接入点后，将`ai.model`改成对应名称，将`ai.supports_vision`改成`true`，系统就会按采样间隔裁剪人体及周边场景、选择多帧JPEG，并沿用同一个异步接口和融合接口。
+
+API配置和运行命令见`AI_SETUP.md`。

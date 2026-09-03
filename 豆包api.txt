@@ -1,0 +1,13 @@
+                                               |    7 |                NULL | NULL                | 2062018771421450242 | 2026-07-15 17:55:25 |
+| LLM_DoubaoLLM              | llm        | DoubaoLLM              | 豆包大模型                               |          1 |          1 | {"type": "openai", "top_k": "5", "top_p": "0.5",
+ "api_key": "ark-38a33ca7-d666-41e5-8720-02089a2b2cb5-d29b5",
+ "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+ "max_tokens": "4096",
+ "model_name": "doubao-seed-character-260628",
+ "temperature": "0.5", "frequency_penalty": "0.5"}                                                                                                                                                                                                                      | https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement                                                                           | 豆包大模型配置说明：
+1. 访问 https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement
+2. 开通Doubao-1.5-pro服务
+3. 访问 https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey 获取API密钥
+4. 填入配置文件中
+5. 当前建议使用doubao-1-5-pro-32k-250115
+注意：有免费额度500000token                           

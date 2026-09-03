@@ -13,7 +13,9 @@ main.py 只负责组织整个程序，不重复各个评分模块内部的计算
 7. height.py、velocity.py、static.py分别计算H、V、S；
 8. scene.py计算人物场景关系和场景分C；
 9. fall_detector.py对有效维度加权并输出FALL或NO_FALL；
-10. 在OpenCV窗口显示识别框、关键点、各维度分数和最终结果。
+10. ai_verifier.py在本地疑似时异步调用豆包进行二次复核；
+11. decision_fusion.py融合本地与AI结果，alert_manager.py发布状态变化事件；
+12. 在OpenCV窗口显示识别框、关键点、各维度分数和最终结果。
 
 3D降级原则：
 - 3D正常时使用P3D、H、V、S和C；
@@ -21,6 +23,13 @@ main.py 只负责组织整个程序，不重复各个评分模块内部的计算
 - 只要Track ID稳定、2D姿态角有效，仍可使用P2D更新状态机；
 - 纯2D模式使用更高阈值和更长确认时间，降低误报；
 - 已确认FALL后，不会因为Depth突然丢失而自动解除报警。
+
+AI复核原则：
+- AI采用事件触发，不固定每秒上传，不阻塞相机主循环；
+- 当前豆包文本模型读取P/H/V/S/C时间序列，不直接读取图片；
+- 后续视觉模型的多帧JPEG接口已经预留，可通过配置开启；
+- API密钥缺失、断网、超时或AI不确定时，继续使用本地结果；
+- 本地状态机确认的FALL优先，AI不能将其改成NO_FALL。
 
 所有可调参数来自config.yaml。
 ground_detector.py是独立地面标定工具，本文件只读取它生成的ground.yaml。
@@ -35,6 +44,21 @@ from typing import Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import yaml
 
+from ai_verifier import (
+    AIFallCoordinator,
+    AIFrameObservation,
+    AIPersonStatus,
+    run_self_test as ai_self_test,
+)
+from alert_manager import (
+    AlertManager,
+    run_self_test as alert_self_test,
+)
+from decision_fusion import (
+    DecisionFusion,
+    FusionDecision,
+    run_self_test as fusion_self_test,
+)
 from fall_detector import (
     FallDecision,
     FallDetector,
@@ -87,6 +111,7 @@ LIVE_STAGES = (
     "static",
     "scene",
     "fall_detector",
+    "ai",
     "full",
 )
 
@@ -146,6 +171,8 @@ def load_config(path: str) -> dict:
         "static_score",
         "scene",
         "fall_detector",
+        "ai",
+        "alerts",
         "display",
     )
     missing = [name for name in required_sections if name not in config]
@@ -182,6 +209,30 @@ def load_config(path: str) -> dict:
     mask_alpha = float(config["display"]["scene_mask_alpha"])
     if not 0.0 <= mask_alpha <= 1.0:
         raise ValueError("display.scene_mask_alpha必须在0到1之间")
+
+    # API密钥只检查环境变量名称，密钥本身不能出现在config.yaml中。
+    ai_config = config["ai"]
+    if not str(ai_config["api_key_env"]).strip():
+        raise ValueError("ai.api_key_env不能为空")
+    if not str(ai_config["base_url"]).startswith("https://"):
+        raise ValueError("ai.base_url必须使用https://")
+    if int(ai_config["request"]["max_workers"]) <= 0:
+        raise ValueError("ai.request.max_workers必须大于0")
+    if int(ai_config["request"]["max_pending_requests"]) <= 0:
+        raise ValueError("ai.request.max_pending_requests必须大于0")
+
+    score_keys = (
+        ("ai.trigger.fall_score", ai_config["trigger"]["fall_score"]),
+        ("ai.trigger.min_pose_score", ai_config["trigger"]["min_pose_score"]),
+        ("ai.trigger.min_data_quality", ai_config["trigger"]["min_data_quality"]),
+        (
+            "ai.fusion.min_ai_fall_confidence",
+            ai_config["fusion"]["min_ai_fall_confidence"],
+        ),
+    )
+    for name, value in score_keys:
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"{name}必须在0到1之间")
 
     window_names = config["display"].get("window_names", {})
     missing_windows = [stage for stage in LIVE_STAGES if stage not in window_names]
@@ -862,6 +913,113 @@ def build_fall_evidence(
 
 
 # ----------------------------------------------------------------------
+# 本地结果转换为AI复核输入
+# ----------------------------------------------------------------------
+
+def encode_person_crop(
+    image: np.ndarray,
+    bbox: Sequence[float],
+    ai_config: dict,
+) -> Optional[bytes]:
+    """裁剪人体及周边场景并编码为JPEG，供后续视觉模型使用。
+
+    当前文本模型supports_vision=false时，main.py不会调用本函数，因此不会
+    产生额外JPEG编码开销。切换视觉模型后，事件缓冲区只按配置间隔调用。
+    """
+    import cv2
+
+    if image is None or image.ndim != 3:
+        return None
+
+    image_height, image_width = image.shape[:2]
+    x1, y1, x2, y2 = map(float, bbox)
+    box_width = max(1.0, x2 - x1)
+    box_height = max(1.0, y2 - y1)
+    margin = float(ai_config["buffer"]["crop_margin_ratio"])
+
+    crop_x1 = max(0, int(np.floor(x1 - box_width * margin)))
+    crop_y1 = max(0, int(np.floor(y1 - box_height * margin)))
+    crop_x2 = min(image_width, int(np.ceil(x2 + box_width * margin)))
+    crop_y2 = min(image_height, int(np.ceil(y2 + box_height * margin)))
+    if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+        return None
+
+    crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
+    jpeg_quality = int(ai_config["buffer"]["jpeg_quality"])
+    success, encoded = cv2.imencode(
+        ".jpg",
+        crop,
+        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+    )
+    return encoded.tobytes() if success else None
+
+
+def build_ai_observation(
+    measurement: PersonMeasurement,
+    timestamp_s: float,
+    decision: FallDecision,
+    pose_3d_result: Pose3DResult,
+    pose_2d_result: Optional[Pose2DResult],
+    velocity_result: Optional[VelocityScoreResult],
+    static_result: Optional[StaticScoreResult],
+    scene_result: Optional[SceneRelationResult],
+    image_jpeg: Optional[bytes] = None,
+) -> AIFrameObservation:
+    """把画面测量和本地状态机结果整理成AI可理解的一条时间序列数据。"""
+    angle_2d = (
+        pose_2d_result.image_angle_deg
+        if pose_2d_result is not None and pose_2d_result.valid_angle
+        else None
+    )
+    angle_3d = (
+        pose_3d_result.filtered_angle_deg
+        if pose_3d_result.valid
+        else None
+    )
+    vertical_velocity = (
+        velocity_result.vertical_velocity_mps
+        if velocity_result is not None and velocity_result.valid
+        else None
+    )
+    static_duration = (
+        static_result.static_duration_s
+        if static_result is not None and static_result.valid_motion
+        else None
+    )
+
+    return AIFrameObservation(
+        person_id=measurement.person_id,
+        timestamp_s=float(timestamp_s),
+        local_label=decision.label,
+        local_fall_score=decision.fall_score,
+        pose_score=decision.pose_score,
+        height_score=decision.height_score,
+        velocity_score=decision.velocity_score,
+        static_score=decision.static_score,
+        scene_score=decision.scene_score,
+        valid_dimensions=decision.valid_dimensions,
+        degraded_mode=decision.degraded_mode,
+        data_quality=decision.data_quality,
+        angle_2d_deg=angle_2d,
+        angle_3d_deg=angle_3d,
+        hip_height_m=measurement.hip_height_m,
+        vertical_velocity_mps=vertical_velocity,
+        static_duration_s=static_duration,
+        scene_relation=(
+            scene_result.relation
+            if scene_result is not None
+            else "unknown"
+        ),
+        scene_confidence=(
+            scene_result.confidence
+            if scene_result is not None
+            else 0.0
+        ),
+        image_jpeg=image_jpeg,
+    )
+
+
+# ----------------------------------------------------------------------
 # YOLO Seg结果转换
 # ----------------------------------------------------------------------
 
@@ -1048,15 +1206,29 @@ def draw_person(
     static_result: Optional[StaticScoreResult],
     scene_result: Optional[SceneRelationResult],
     decision: Optional[FallDecision],
+    ai_status: Optional[AIPersonStatus],
+    fusion_decision: Optional[FusionDecision],
     config: dict,
     stage: str,
 ) -> None:
-    """绘制人体框、关键点、五维数据和最终判断结果。"""
+    """绘制人体框、五维数据、本地结果、AI状态和最终融合结果。"""
     import cv2
 
     x1, y1, x2, y2 = map(int, measurement.bbox)
 
-    if decision is not None:
+    if fusion_decision is not None:
+        color = (
+            (0, 0, 255)
+            if fusion_decision.is_fall
+            else (0, 255, 0)
+        )
+        label = (
+            f"ID {measurement.person_id} "
+            f"{fusion_decision.label} "
+            f"local={fusion_decision.local_fall_score:.2f} "
+            f"{fusion_decision.source}"
+        )
+    elif decision is not None:
         color = (
             (0, 0, 255)
             if decision.is_fall
@@ -1116,6 +1288,7 @@ def draw_person(
                 if scene_result is not None
                 else "SCENE N/A"
             ),
+            "ai": "AI WAITING LOCAL RESULT",
         }
         label = (
             f"ID {measurement.person_id} "
@@ -1320,6 +1493,29 @@ def draw_person(
             f"weight={decision.available_weight:.2f}"
         )
 
+    if ai_status is not None:
+        ai_confidence_text = (
+            f"{ai_status.result.confidence:.2f}"
+            if ai_status.result is not None and ai_status.result.success
+            else "N/A"
+        )
+        ai_input_mode = (
+            "VISION"
+            if ai_status.result is not None and ai_status.result.includes_images
+            else "DATA"
+        )
+        values.append(
+            f"AI={ai_status.state} "
+            f"conf={ai_confidence_text} "
+            f"input={ai_input_mode}"
+        )
+
+    if fusion_decision is not None:
+        values.append(
+            f"FINAL={fusion_decision.label} "
+            f"source={fusion_decision.source}"
+        )
+
     line_height = int(config["display"]["line_height_px"])
     text_y = min(
         image.shape[0] - 8,
@@ -1446,31 +1642,41 @@ def run_live(
         "pose_2d",
         "static",
         "fall_detector",
+        "ai",
         "full",
     }
     needs_height = stage in {
         "height",
         "static",
         "fall_detector",
+        "ai",
         "full",
     }
     needs_velocity = stage in {
         "velocity",
         "fall_detector",
+        "ai",
         "full",
     }
     needs_static = stage in {
         "static",
         "fall_detector",
+        "ai",
         "full",
     }
     needs_scene = stage in {
         "scene",
         "fall_detector",
+        "ai",
         "full",
     }
     needs_fall = stage in {
         "fall_detector",
+        "ai",
+        "full",
+    }
+    needs_ai = stage in {
+        "ai",
         "full",
     }
 
@@ -1537,6 +1743,32 @@ def run_live(
         if needs_fall
         else None
     )
+    ai_coordinator = (
+        AIFallCoordinator(config)
+        if needs_ai
+        else None
+    )
+    decision_fusion = (
+        DecisionFusion(config)
+        if needs_ai
+        else None
+    )
+    alert_manager = (
+        AlertManager(config)
+        if needs_ai
+        else None
+    )
+
+    if (
+        ai_coordinator is not None
+        and ai_coordinator.enabled
+        and not ai_coordinator.verifier.client.ready
+    ):
+        key_name = ai_coordinator.verifier.client.api_key_env
+        print(
+            f"警告：没有找到环境变量{key_name}，"
+            "当前自动使用本地判断，设置密钥后AI会自动启用"
+        )
 
     def reset_person(person_id: int) -> None:
         """一个Track ID离场后清除该人的全部历史。"""
@@ -1548,6 +1780,9 @@ def run_live(
             static_scorer,
             scene_scorer,
             fall_detector,
+            ai_coordinator,
+            decision_fusion,
+            alert_manager,
         )
         for module in modules:
             if module is not None:
@@ -1687,6 +1922,10 @@ def run_live(
                 verbose=False,
             )
             now = time.monotonic()
+
+            # 只检查已经完成的后台任务，不等待网络，因此不会降低相机帧率。
+            if ai_coordinator is not None:
+                ai_coordinator.poll(now)
 
             # 推理完成以后再画家具，防止Mask和框污染Pose模型输入。
             if needs_scene:
@@ -1885,6 +2124,56 @@ def run_live(
                         ):
                             decision = fall_detector.update(evidence)
 
+                        ai_status = None
+                        fusion_decision = None
+                        if decision is not None and ai_coordinator is not None:
+                            # 当前文本模型不编码图片；以后开启视觉模型后，
+                            # 仅在缓冲采样时裁剪人体及周边场景。
+                            image_jpeg = None
+                            if ai_coordinator.should_capture_image(person_id, now):
+                                image_jpeg = encode_person_crop(
+                                    inference_image,
+                                    measurement.bbox,
+                                    config["ai"],
+                                )
+
+                            ai_observation = build_ai_observation(
+                                measurement,
+                                now,
+                                decision,
+                                pose_3d_result,
+                                pose_2d_result,
+                                velocity_result,
+                                static_result,
+                                scene_result,
+                                image_jpeg,
+                            )
+                            ai_coordinator.observe(ai_observation)
+                            ai_result = ai_coordinator.latest_result(
+                                person_id,
+                                now,
+                            )
+                            ai_status = ai_coordinator.status(
+                                person_id,
+                                now,
+                            )
+
+                            if decision_fusion is not None:
+                                fusion_decision = decision_fusion.update(
+                                    decision,
+                                    ai_result,
+                                    now,
+                                )
+                            if (
+                                alert_manager is not None
+                                and fusion_decision is not None
+                            ):
+                                alert_manager.update(
+                                    fusion_decision,
+                                    now,
+                                    ai_result,
+                                )
+
                         draw_person(
                             image,
                             measurement,
@@ -1896,6 +2185,8 @@ def run_live(
                             static_result,
                             scene_result,
                             decision,
+                            ai_status,
+                            fusion_decision,
                             config,
                             stage,
                         )
@@ -1939,6 +2230,8 @@ def run_live(
     except KeyboardInterrupt:
         print("用户退出")
     finally:
+        if ai_coordinator is not None:
+            ai_coordinator.close()
         if pipeline_started:
             pipeline.stop()
         cv2.destroyAllWindows()
@@ -1958,6 +2251,9 @@ def run_self_test(config: dict) -> None:
     static_self_test(config)
     scene_self_test(config)
     fall_self_test(config)
+    ai_self_test(config)
+    fusion_self_test(config)
+    alert_self_test(config)
 
     intrinsics = {
         "width": 20,
@@ -2111,7 +2407,7 @@ def run_self_test(config: dict) -> None:
     print("main integration self-test: PASS")
     print(
         "  projection, Seg mask, P/H/V/S/C, "
-        "missing-3D fallback, state machine=PASS"
+        "missing-3D fallback, AI async/fusion/alert=PASS"
     )
 
 
