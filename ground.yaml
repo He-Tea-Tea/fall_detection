@@ -1,14 +1,14 @@
 coordinate_system: RGB_COLOR_ALIGNED_DEPTH
 description: Ground plane fitted from Depth aligned to RGB color coordinates
 plane:
-  A: 0.0009534442371557843
-  B: -0.9668675229347725
-  C: -0.2552768772099496
-  D: 1.2950786965953698
+  A: 0.0043569589036372425
+  B: -0.9736422300930836
+  C: -0.22803908587888824
+  D: 1.2939563990426162
 normal:
-  x: 0.0009534442371557843
-  y: -0.9668675229347725
-  z: -0.2552768772099496
+  x: 0.0043569589036372425
+  y: -0.9736422300930836
+  z: -0.22803908587888824
 camera_intrinsics:
   width: 640
   height: 400
@@ -18,12 +18,12 @@ camera_intrinsics:
   cy: 206.36656188964844
 ransac:
   distance_threshold_m: 0.025
-  inlier_count: 79928
-  total_point_count: 105192
-  inlier_ratio: 0.7598296448399118
+  inlier_count: 81770
+  total_point_count: 107267
+  inlier_ratio: 0.7623034111143222
 quality:
-  mean_error_m: 0.006237507332116365
-  max_error_m: 0.024996519088745117
-  normal_y: 0.9668675229347725
-  normal_tilt_deg: 14.79009755251674
-  valid_ratio: 0.7598296448399118
+  mean_error_m: 0.006160196848213673
+  max_error_m: 0.02499520778656006
+  normal_y: 0.9736422300930836
+  normal_tilt_deg: 13.184101089371524
+  valid_ratio: 0.7623034111143222
