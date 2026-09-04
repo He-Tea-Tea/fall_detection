@@ -4,13 +4,20 @@
 paths:                                      # 外部文件路径
   ground_file: ground.yaml                  # 地面标定结果；相对路径以config.yaml目录为基准
 models:                                     # YOLO模型与推理参数
-  pose_model: yolo26s-pose.pt               # 人体框、17个关键点和Track ID使用的Pose模型
-  scene_model: yolo26s-seg.pt               # 床、沙发、椅子使用的实例分割模型，必须返回Mask
+  pose_model: yolo26s-pose.pt               # 可换为同模型导出的.onnx；输出必须包含Pose关键点
+  scene_model: yolo26s-seg.pt               # 可换为同模型导出的.onnx；输出必须包含实例Mask
   pose_conf: 0.45                           # 人体检测最低置信度，调低减少漏检但增加误检
   scene_conf: 0.35                          # 家具检测最低置信度，调低更容易检测遮挡家具
   scene_retina_masks: true                  # 是否输出精细Mask；true边缘更准但稍占显存
   tracker: botsort.yaml                     # 人体跟踪器，用于保持稳定Track ID
   scene_inference_interval_frames: 3        # 每隔多少帧运行一次家具Seg，调大更省算力
+
+#--------------------------------------runtime-------------------------------------#
+runtime:                                    # Windows/Linux和PT/ONNX共用的推理运行参数
+  device: auto                              # auto自动选择；cpu强制CPU；0表示第一张NVIDIA GPU
+  use_half: true                            # 仅PT+CUDA启用FP16；CPU和ONNX由后端自行决定精度
+  pose_imgsz: 640                           # Pose模型输入尺寸，必须与导出ONNX尺寸一致
+  scene_imgsz: 640                          # Seg模型输入尺寸，必须与导出ONNX尺寸一致
 
 #--------------------------------------camera-------------------------------------#
 camera:                                     # RGB-D取帧与标定一致性检查
@@ -241,6 +248,17 @@ http_bridge:                                # 与同机独立程序 HTTP 通讯�
   timeout_s: 2.0                            # 单次发送超时；后台发送不会阻塞相机
   retry_count: 2                            # 首次失败后最多再重试的次数
   retry_interval_s: 0.3                     # 两次发送尝试之间的等待时间（秒）
+
+#--------------------------------------logging-------------------------------------#
+logging:                                    # 统一终端日志和自动轮转文件日志
+  enabled: true                             # true保存日志文件；false不创建日志文件
+  console_enabled: true                     # 是否同时在终端显示日志
+  level: INFO                               # DEBUG、INFO、WARNING、ERROR或CRITICAL
+  directory: Log                            # 日志目录；相对路径按项目目录解析
+  filename: fall_detection.log              # 当前日志文件名
+  max_file_size_mb: 10                      # 单个日志达到10MB后自动轮转
+  backup_count: 5                           # 最多保留5份历史日志
+  repeated_warning_interval_s: 5.0          # 相同高频警告最短输出间隔，单位秒
 
 #--------------------------------------display-------------------------------------#
 display:                                    # OpenCV可视化

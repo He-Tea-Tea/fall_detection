@@ -21,12 +21,15 @@
 """
 
 import json
+import logging
 import queue
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib import request as url_request
+
+logger = logging.getLogger(__name__)
 
 
 class HttpBridge:
@@ -114,10 +117,7 @@ class HttpBridge:
         try:
             self._send_queue.put_nowait(is_fall)
         except queue.Full:
-            print(
-                "[http_bridge] 发送队列已满，"
-                f"本次结果未发送：fall={is_fall}"
-            )
+            logger.warning("HTTP发送队列已满，本次结果未发送：fall=%s", is_fall)
 
     def _send_worker(self) -> None:
         """后台线程持续读取发送队列并执行HTTP请求。"""
@@ -171,27 +171,22 @@ class HttpBridge:
                             f"HTTP状态码异常：{response.status}"
                         )
 
-                print(
-                    "[http_bridge] 最终结果发送成功："
-                    f"fall={is_fall}"
-                )
+                logger.info("HTTP最终结果发送成功：fall=%s", is_fall)
                 return True
 
             except Exception as error:
                 current_attempt = attempt + 1
 
                 if current_attempt >= total_attempts:
-                    print(
-                        "[http_bridge] 最终结果发送失败，"
-                        "本地跌倒检测继续运行："
-                        f"{type(error).__name__}: {error}"
+                    logger.warning(
+                        "HTTP最终结果发送失败，本地检测继续：%s: %s",
+                        type(error).__name__, error,
                     )
                     return False
 
-                print(
-                    "[http_bridge] 发送失败，准备重试："
-                    f"{current_attempt}/{total_attempts}，"
-                    f"{type(error).__name__}: {error}"
+                logger.warning(
+                    "HTTP发送失败，准备重试：%d/%d，%s: %s",
+                    current_attempt, total_attempts, type(error).__name__, error,
                 )
                 time.sleep(self.retry_interval_s)
 
@@ -289,10 +284,7 @@ class HttpBridge:
                         if person_id is None
                         else f"person_id={person_id}"
                     )
-                    print(
-                        "[http_bridge] 已收到重置请求："
-                        f"{target_text}"
-                    )
+                    logger.info("HTTP已收到重置请求：%s", target_text)
 
                     self._send_json(
                         202,
@@ -361,10 +353,9 @@ class HttpBridge:
         )
         self._server_thread.start()
 
-        print(
-            "[http_bridge] 重置接口已启动："
-            f"http://{self.listen_host}:"
-            f"{self.listen_port}/reset"
+        logger.info(
+            "HTTP重置接口已启动：http://%s:%d/reset",
+            self.listen_host, self.listen_port,
         )
 
     def poll_reset_requests(self) -> list:

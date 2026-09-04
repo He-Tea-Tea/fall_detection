@@ -36,6 +36,7 @@ ground_detector.py是独立地面标定工具，本文件只读取它生成的gr
 """
 
 import argparse
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,8 +102,10 @@ from velocity import (
 )
 
 from http_bridge import HttpBridge
+from logging_utils import configure_logging, log_rate_limiter
 
 BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 # 每个功能文件不带--self-test运行时，都会调用main.py并选择对应stage。
 LIVE_STAGES = (
@@ -175,6 +178,9 @@ def load_config(path: str) -> dict:
         "fall_detector",
         "ai",
         "alerts",
+        "http_bridge",
+        "runtime",
+        "logging",
         "display",
     )
     missing = [name for name in required_sections if name not in config]
@@ -237,6 +243,20 @@ def load_config(path: str) -> dict:
     if not 1 <= int(image_config["jpeg_quality"]) <= 100:
         raise ValueError("ai.image.jpeg_quality必须在1到100之间")
 
+    runtime_cfg = config["runtime"]
+    if str(runtime_cfg["device"]).strip().lower() == "":
+        raise ValueError("runtime.device不能为空")
+    if int(runtime_cfg["pose_imgsz"]) <= 0 or int(runtime_cfg["scene_imgsz"]) <= 0:
+        raise ValueError("runtime.pose_imgsz和runtime.scene_imgsz必须大于0")
+
+    logging_cfg = config["logging"]
+    if float(logging_cfg["max_file_size_mb"]) <= 0.0:
+        raise ValueError("logging.max_file_size_mb必须大于0")
+    if int(logging_cfg["backup_count"]) < 0:
+        raise ValueError("logging.backup_count不能小于0")
+    if float(logging_cfg["repeated_warning_interval_s"]) < 0.0:
+        raise ValueError("logging.repeated_warning_interval_s不能小于0")
+
     score_keys = (
         ("ai.trigger.fall_score", ai_config["trigger"]["fall_score"]),
         (
@@ -264,6 +284,47 @@ def resolve_config_path(config_path: str, value: str) -> Path:
     if path.is_absolute():
         return path
     return Path(config_path).resolve().parent / path
+
+
+def resolve_inference_runtime(
+    config: dict,
+    pose_model_path: Path,
+    scene_model_path: Path,
+) -> tuple:
+    """选择CPU/GPU，并只为PT+CUDA启用FP16。
+
+    ONNX的FP32/FP16由导出文件决定，运行时不再强制half，避免类型不匹配。
+    """
+    import torch
+
+    configured = str(config["runtime"]["device"]).strip().lower()
+    if configured == "auto":
+        device = "0" if torch.cuda.is_available() else "cpu"
+    elif configured == "cpu":
+        device = "cpu"
+    elif not torch.cuda.is_available():
+        logger.warning("配置要求CUDA设备%s，但CUDA不可用，自动回退CPU", configured)
+        device = "cpu"
+    else:
+        device = configured
+
+    all_pt = (
+        pose_model_path.suffix.lower() == ".pt"
+        and scene_model_path.suffix.lower() == ".pt"
+    )
+    use_half = bool(
+        config["runtime"]["use_half"]
+        and device != "cpu"
+        and all_pt
+    )
+    logger.info(
+        "推理运行环境：device=%s half=%s pose=%s scene=%s",
+        device,
+        use_half,
+        pose_model_path.suffix.lower(),
+        scene_model_path.suffix.lower(),
+    )
+    return device, use_half
 
 
 def load_ground_metadata(path: str) -> dict:
@@ -1202,7 +1263,7 @@ def wait_first_frames(pipeline, camera_cfg: dict):
             return frames
 
     if last_color_frames is not None:
-        print("警告：启动时未获得Depth，将暂时使用纯2D降级模式")
+        logger.warning("启动时未获得Depth，将暂时使用纯2D降级模式")
         return last_color_frames
 
     raise RuntimeError("无法获取RGB首帧")
@@ -1653,6 +1714,7 @@ def run_live(
     stage: str = "full",
 ) -> None:
     """打开真实相机并执行指定功能阶段或完整流程。"""
+    configure_logging(config, BASE_DIR)
     if stage not in LIVE_STAGES:
         raise ValueError(
             f"未知测试阶段：{stage}，可选值为{LIVE_STAGES}"
@@ -1717,14 +1779,23 @@ def run_live(
         config_path,
         config["models"]["scene_model"],
     )
+    required_model_paths = [pose_model_path]
+    if needs_scene:
+        required_model_paths.append(scene_model_path)
+    for model_path in required_model_paths:
+        if not model_path.is_file():
+            raise FileNotFoundError(f"模型文件不存在：{model_path}")
+    inference_device, use_half = resolve_inference_runtime(
+        config, pose_model_path, scene_model_path
+    )
 
     ground_plane = load_ground_plane(str(ground_path))
     ground_data = load_ground_metadata(str(ground_path))
 
     if needs_scene:
-        print("加载YOLO26 Pose与YOLO26 Seg模型...")
+        logger.info("加载YOLO26 Pose与YOLO26 Seg模型")
     else:
-        print("加载YOLO26 Pose模型...")
+        logger.info("加载YOLO26 Pose模型")
 
     pose_model = YOLO(str(pose_model_path))
     scene_model = (
@@ -1790,26 +1861,14 @@ def run_live(
         and not ai_coordinator.verifier.client.ready
     ):
         key_name = ai_coordinator.verifier.client.api_key_env
-        print(
-            f"警告：没有找到{key_name}或ai.api_key，"
-            "当前跳过AI并直接使用本地判断"
+        logger.warning(
+            "没有找到%s或ai.api_key，当前跳过AI并直接使用本地判断",
+            key_name,
         )
 
-    # ===== HTTP 桥接：发送融合结果 + 接收对端重置请求 =====
-    bridge = HttpBridge(config)
-
-    def reset_all_judgement():
-        """对端请求重置：清空所有人历史，使下次跌倒能重新报警。"""
-        for person_id in list(last_seen_s.keys()):
-            reset_person(person_id)
-        last_seen_s.clear()
-
-    if alert_manager is not None:
-        alert_manager.register_handler(bridge.handle_alert)  # FALL 翻转 -> POST true/false
-    bridge.start_server(reset_all_judgement)
-
     def reset_person(person_id: int) -> None:
-        """一个Track ID离场后清除该人的全部历史。"""
+        """由主线程清除一个Track ID在全部模块里的历史。"""
+        person_id = int(person_id)
         pose_3d_detector.reset_person(person_id)
 
         modules = (
@@ -1825,6 +1884,13 @@ def run_live(
         for module in modules:
             if module is not None:
                 module.reset_person(person_id)
+
+    # HTTP线程只负责收发，真正的重置在下面的相机主循环中执行。
+    last_seen_s: Dict[int, float] = {}
+    bridge = HttpBridge(config)
+    if alert_manager is not None:
+        alert_manager.register_handler(bridge.handle_alert)
+    bridge.start_server()
 
     pipeline = Pipeline()
     pipeline_started = False
@@ -1850,7 +1916,7 @@ def run_live(
                 raise RuntimeError(
                     f"当前相机与ground.yaml不一致：{message}"
                 )
-            print(f"警告：{message}")
+            logger.warning("地面标定检查警告：%s", message)
 
         align_filter = AlignFilter(
             align_to_stream=OBStreamType.COLOR_STREAM
@@ -1858,15 +1924,26 @@ def run_live(
 
         # 家具变化较慢，因此Seg不是每帧运行，帧间复用最近一次结果。
         scene_detections: List[SceneObjectDetection] = []
-        last_seen_s: Dict[int, float] = {}
         frame_index = 0
 
         window_name = str(
             config["display"]["window_names"][stage]
         )
-        print(f"{stage}相机测试已启动，按ESC退出")
+        logger.info("相机测试已启动：stage=%s，按ESC退出", stage)
 
         while True:
+            # HTTP服务线程只入队；所有状态清理在主线程完成，避免数据竞争。
+            for reset_id in bridge.poll_reset_requests():
+                if reset_id is None:
+                    for person_id in list(last_seen_s.keys()):
+                        reset_person(person_id)
+                    last_seen_s.clear()
+                    logger.info("已按外部请求重置全部人员状态")
+                else:
+                    reset_person(reset_id)
+                    last_seen_s.pop(reset_id, None)
+                    logger.info("已按外部请求重置人员：ID=%d", reset_id)
+
             raw_frames = pipeline.wait_for_frames(
                 int(config["camera"]["frame_timeout_ms"])
             )
@@ -1883,7 +1960,9 @@ def run_live(
                     frames = aligned_frames
                     depth_aligned = True
             except Exception as error:
-                print(f"D2C对齐失败，本帧使用纯2D模式：{error}")
+                interval = float(config["logging"]["repeated_warning_interval_s"])
+                if log_rate_limiter.allow("depth_alignment_failed", interval):
+                    logger.warning("D2C对齐失败，本帧使用纯2D模式：%s", error)
 
             color_frame = frames.get_color_frame()
             if color_frame is None and frames is not raw_frames:
@@ -1913,10 +1992,9 @@ def run_live(
                 depth_m = depth_frame_to_meters(depth_frame)
 
                 if depth_m.shape != image.shape[:2]:
-                    print(
-                        "D2C后RGB与Depth尺寸不一致，"
-                        "本帧使用纯2D模式"
-                    )
+                    interval = float(config["logging"]["repeated_warning_interval_s"])
+                    if log_rate_limiter.allow("depth_size_mismatch", interval):
+                        logger.warning("D2C后RGB与Depth尺寸不一致，本帧使用纯2D模式")
                     depth_m = create_missing_depth(image.shape[:2])
 
             # 家具Seg按照配置的间隔运行，其余帧复用最近一次检测结果。
@@ -1934,6 +2012,9 @@ def run_live(
                     scene_results = scene_model(
                         inference_image,
                         conf=float(config["models"]["scene_conf"]),
+                        imgsz=int(config["runtime"]["scene_imgsz"]),
+                        device=inference_device,
+                        half=use_half,
                         retina_masks=bool(
                             config["models"]["scene_retina_masks"]
                         ),
@@ -1957,6 +2038,9 @@ def run_live(
                 persist=True,
                 tracker=config["models"]["tracker"],
                 conf=float(config["models"]["pose_conf"]),
+                imgsz=int(config["runtime"]["pose_imgsz"]),
+                device=inference_device,
+                half=use_half,
                 verbose=False,
             )
             now = time.monotonic()
@@ -2266,16 +2350,16 @@ def run_live(
             frame_index += 1
 
     except KeyboardInterrupt:
-        print("用户退出")
+        logger.info("用户请求退出")
     finally:
         if ai_coordinator is not None:
             ai_coordinator.close()
         if bridge is not None:
-                    bridge.stop()
+            bridge.stop()
         if pipeline_started:
-            pipeline.stop() 
+            pipeline.stop()
         cv2.destroyAllWindows()
-        print("Camera stopped")
+        logger.info("相机和运行资源已关闭")
 
 
 # ----------------------------------------------------------------------
@@ -2497,6 +2581,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    configure_logging(config, BASE_DIR)
 
     if args.self_test:
         run_self_test(config)

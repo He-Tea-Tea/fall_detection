@@ -1,3 +1,5 @@
+Log/
+
 # Python缓存
 __pycache__/
 *.py[cod]
@@ -24,3 +26,4 @@ debug_ai/
 
 # 临时文件
 *.tmp
+*.log

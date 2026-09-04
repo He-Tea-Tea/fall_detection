@@ -10,6 +10,7 @@ NO_FALL时发送一次恢复事件，不会因为主循环每帧运行而重复�
 """
 
 import argparse
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -18,6 +19,8 @@ import yaml
 
 from ai_verifier import AIVerificationResult
 from decision_fusion import FusionDecision
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,13 +62,13 @@ class AlertManager:
     def _console_handler(event: AlertEvent) -> None:
         """当前默认处理器：在终端打印状态变化，不执行外部动作。"""
         if event.event_type == "FALL_CONFIRMED":
-            print(
-                f"[ALERT] ID={event.person_id} FALL "
-                f"source={event.source} local={event.local_fall_score:.2f} "
-                f"AI={event.ai_verdict}:{event.ai_confidence:.2f}"
+            logger.warning(
+                "确认跌倒：ID=%d source=%s local=%.2f AI=%s:%.2f",
+                event.person_id, event.source, event.local_fall_score,
+                event.ai_verdict, event.ai_confidence,
             )
         else:
-            print(f"[RECOVERED] ID={event.person_id} NO_FALL")
+            logger.info("跌倒状态恢复：ID=%d NO_FALL", event.person_id)
 
     def update(
         self,
@@ -106,7 +109,7 @@ class AlertManager:
             try:
                 handler(event)
             except Exception as error:
-                print(f"警告：告警处理器执行失败：{error}")
+                logger.exception("告警处理器执行失败：%s", error)
         return event
 
     def reset_person(self, person_id: int) -> None:

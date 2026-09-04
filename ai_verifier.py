@@ -18,6 +18,7 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -27,9 +28,12 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import yaml
 
+from logging_utils import configure_logging
+
 AI_FALL = "FALL"
 AI_NO_FALL = "NO_FALL"
 AI_UNCERTAIN = "UNCERTAIN"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -380,23 +384,20 @@ class ArkResponsesClient:
             payload = self.build_payload(request)
             if self.debug_enabled:
                 image_size_kb = len(observation.image_jpeg or b"") / 1024.0
-                print(
-                    "[AI DEBUG] API请求开始："
-                    f"ID={request.person_id} event={request.event_id} "
-                    f"local={observation.local_fall_score:.2f} "
-                    f"jpeg={image_size_kb:.1f}KB model={self.model}"
+                logger.info(
+                    "AI请求开始：ID=%d event=%s local=%.2f jpeg=%.1fKB model=%s",
+                    request.person_id, request.event_id,
+                    observation.local_fall_score, image_size_kb, self.model,
                 )
             response = self._request_api(payload)
             raw_answer = self._extract_answer_text(response)
             verdict, confidence, reason, observations = self._parse_answer(raw_answer)
             completed_s = time.monotonic()
             if self.debug_enabled:
-                print(
-                    "[AI DEBUG] API请求完成："
-                    f"ID={request.person_id} verdict={verdict} "
-                    f"confidence={confidence:.2f} "
-                    f"latency={completed_s - started_s:.2f}s "
-                    f"answer={raw_answer!r}"
+                logger.info(
+                    "AI请求完成：ID=%d verdict=%s confidence=%.2f latency=%.2fs answer=%r",
+                    request.person_id, verdict, confidence,
+                    completed_s - started_s, raw_answer,
                 )
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -420,10 +421,10 @@ class ArkResponsesClient:
         except Exception as error:
             completed_s = time.monotonic()
             if self.debug_enabled:
-                print(
-                    "[AI DEBUG] API请求失败，改用本地判断："
-                    f"ID={request.person_id} latency={completed_s - started_s:.2f}s "
-                    f"error={type(error).__name__}: {error}"
+                logger.warning(
+                    "AI请求失败，改用本地判断：ID=%d latency=%.2fs error=%s: %s",
+                    request.person_id, completed_s - started_s,
+                    type(error).__name__, error,
                 )
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -610,17 +611,16 @@ class AIFallCoordinator:
         )
         if not self.verifier.submit(verification_request):
             if self.debug_enabled:
-                print(f"[AI DEBUG] 请求队列已满，本次跳过：ID={person_id}")
+                logger.warning("AI请求队列已满，本次跳过：ID=%d", person_id)
             return False
 
         self.pending_people[person_id] = event_id
         self.last_submit_s[person_id] = now
         self.consecutive_risk[person_id] = 0
         if self.debug_enabled:
-            print(
-                "[AI DEBUG] 单图请求已提交后台线程："
-                f"ID={person_id} event={event_id} "
-                f"FallScore={observation.local_fall_score:.2f}"
+            logger.info(
+                "AI单图请求已提交：ID=%d event=%s FallScore=%.2f",
+                person_id, event_id, observation.local_fall_score,
             )
         return True
 
@@ -650,9 +650,9 @@ class AIFallCoordinator:
                 )
                 self.backoff_until_s = now + delay
                 if self.debug_enabled:
-                    print(
-                        "[AI DEBUG] 进入网络退避："
-                        f"连续失败={self.failure_count}，暂停={delay:.1f}s"
+                    logger.warning(
+                        "AI进入网络退避：连续失败=%d，暂停=%.1fs",
+                        self.failure_count, delay,
                     )
         return accepted_results
 
@@ -973,6 +973,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = load_config(args.config)
+    configure_logging(config, Path(__file__).resolve().parent)
     if args.self_test:
         run_self_test(config)
     elif args.api_test:
