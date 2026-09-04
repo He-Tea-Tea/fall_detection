@@ -1,102 +1,54 @@
-# 豆包AI跌倒复核配置与运行说明
+# 豆包视觉单图跌倒复核配置与运行说明
 
-## 1. 当前版本做了什么
+## 1. 当前执行逻辑
 
-本地YOLO Pose、YOLO Seg、Depth和P/H/V/S/C仍然持续运行。只有本地出现疑似风险时，系统才把最近几秒的结构化时间序列提交给豆包；请求在后台线程执行，不会等待网络或阻塞相机。
+本地YOLO Pose、YOLO Seg、Depth和P/H/V/S/C始终连续运行。某个人的本地`FallScore`达到`0.50`时，系统只取触发时刻的一张RGB图片，在后台调用火山方舟视觉模型：
 
-当前模型`doubao-1-5-pro-32k-250115`是文本模型，不能直接分析图片。它读取的内容包括：
+1. `FallScore < 0.50`：不编码图片、不访问网络。
+2. `FallScore >= 0.50`：获取当前一张干净RGB画面。
+3. 图片最长边超过768像素时等比例缩小，然后以质量75编码为JPEG。
+4. 后台线程调用`OpenAI().responses.create()`，相机和本地检测不等待。
+5. AI明确回答`true`或`false`时，在配置的保持时间内以AI结论为主。
+6. AI回答`uncertain`、调用失败、超时、断网或没有密钥时，直接使用本地结果。
+7. 同一人持续高风险时最多每5秒复核一次，本地已确认FALL时最多每10秒复核一次。
 
-- 本地`FALL/NO_FALL`和`FallScore`；
-- P姿态、H高度、V下降速度、S静止、C场景五项分数；
-- 本帧哪些维度有效，以及是否处于2D降级模式；
-- 2D角度、3D角度、髋部高度、垂直速度和静止时间；
-- 人物与地面、床、沙发或椅子的关系。
+默认上传完整画面，因为AI需要看清人究竟倒在地板上，还是正常躺在床、沙发等家具上。若以后改用高分辨率相机，可把`ai.image.mode`改成`person_context`，仅上传人体及周边区域。
 
-该历史模型已经进入官方下线计划。当前API仍可用时本项目可以继续调用，但正式部署前应在火山方舟控制台迁移到仍受支持的模型或推理接入点。模型名称全部来自`config.yaml`，迁移不需要修改Python业务代码。
+## 2. 需要安装的依赖
 
-## 2. 设置API密钥
-
-密钥不能写入Python代码或`config.yaml`，默认从环境变量`ARK_API_KEY`读取。
-
-Windows PowerShell当前窗口：
+在原来的`fall_env`环境中执行：
 
 ```powershell
-$env:ARK_API_KEY="你的API密钥"
+python -m pip install -U openai
 ```
 
-Ubuntu当前终端：
+也可以执行：
 
-```bash
-export ARK_API_KEY="你的API密钥"
+```powershell
+python -m pip install -r requirements-ai.txt
 ```
 
-```bash
-pip install --upgrade "openai>=1.0"
-```
-如果火山方舟要求使用推理接入点ID，把`config.yaml`中的`ai.model`改成控制台提供的`ep-...`，其他代码不用修改。
+## 3. API Key
 
-本版使用Python标准库发送HTTPS请求，不需要额外安装`openai`或火山方舟SDK。
+推荐使用环境变量：
 
-## 3. 推荐测试顺序
-
-先运行全部离线测试，测试过程不会访问真实API：
-
-```bash
-python main.py --self-test
+```powershell
+$env:ARK_API_KEY="你的新API Key"
 ```
 
-再单独发送一次真实API测试：
+如果确实要写在本机配置中：
 
-```bash
-python ai_verifier.py --api-test
+```yaml
+ai:
+  api_key_env: ARK_API_KEY
+  api_key: "你的新API Key"
 ```
 
-打开相机测试本地检测、豆包复核和融合画面：
+程序优先读取`ai.api_key`，该项留空时再读取环境变量。不要把包含真实密钥的`config.yaml`发送给别人或提交到Git。已经在聊天、截图或仓库中暴露的密钥应立即在方舟控制台作废并重新生成。
 
-```bash
-python main.py --stage ai
-```
+## 4. 模型配置
 
-运行完整流程：
-
-```bash
-python main.py
-```
-
-## 4. AI何时调用
-
-系统不固定每秒上传。默认满足以下条件后才调用：
-
-1. 本地总分达到`ai.trigger.fall_score`；
-2. 姿态分达到`ai.trigger.min_pose_score`；
-3. 数据质量达到`ai.trigger.min_data_quality`；
-4. 上述风险连续达到规定帧数，或者本地已经确认FALL；
-5. 同一人员当前没有未完成请求，并且已经超过冷却时间。
-
-本地已经确认FALL后，默认每20秒最多复核一次，不会每帧重复请求。
-
-这种方式比固定每秒调用更省费用，也能减少正常画面上传。
-
-## 5. 画面字段
-
-| 字段 | 含义 |
-|---|---|
-| `AI=IDLE` | 等待本地疑似事件 |
-| `AI=PENDING` | 后台正在调用豆包，主循环仍继续运行 |
-| `AI=FALL` | AI认为像跌倒 |
-| `AI=NO_FALL` | AI认为不像跌倒 |
-| `AI=UNCERTAIN` | AI认为证据不足或互相矛盾 |
-| `AI=NO_KEY` | 没有设置API密钥，当前只使用本地判断 |
-| `AI=ERROR/BACKOFF` | 请求失败或处于网络退避时间 |
-| `input=DATA` | 当前文本模型只读取结构化数据 |
-| `input=VISION` | 后续视觉模型实际接收了JPEG图片 |
-| `FINAL` | 本地和AI融合后的最终二值结果 |
-| `source=LOCAL` | 由本地状态机确认 |
-| `source=AI_ASSISTED` | 中高本地风险获得AI支持后确认 |
-
-## 6. 后续切换视觉模型
-
-在火山方舟开通一个当前可用、支持图片理解的模型或推理接入点，然后修改：
+`ai.model`必须填写账号已经开通、支持图片理解和Responses API的模型ID或`ep-...`接入点ID：
 
 ```yaml
 ai:
@@ -104,13 +56,65 @@ ai:
   supports_vision: true
 ```
 
-系统会自动按`ai.buffer.sample_interval_s`裁剪人体及周边场景，保留最近事件，并为一次请求选择`keyframe_count`张有时间顺序的JPEG。不要给不支持视觉的文本模型开启`supports_vision`，否则API会拒绝图片输入。
+若出现`ModelNotOpen`，表示这个模型名称虽然能被方舟识别，但当前账号没有开通。需要在方舟控制台开通它，或者替换成账号已经开通的视觉模型/接入点。
 
-## 7. 安全边界
+## 5. 测试顺序
 
-- AI不能把本地已经确认的FALL改成NO_FALL。
-- AI返回不确定、超时或断网时，最终判断退回本地结果。
-- 文本AI只有在本地已经达到中高风险时才能辅助确认。
-- 当前控制台告警不会自动停车、转头、说话或发送通知。
-- 后续通过`AlertManager.register_handler()`注册机器人动作和通知处理器。
-- 移动机器人仍需完成IMU、底盘里程计和云台编码器运动补偿，否则H/V/S可能受到机器人自身运动影响。
+先运行完全离线的代码测试：
+
+```powershell
+python ai_verifier.py --self-test
+python decision_fusion.py --self-test
+python main.py --self-test
+```
+
+再上传一张真实图片测试视觉API：
+
+```powershell
+python ai_verifier.py --api-test test.jpg
+```
+
+图片也可以是URL：
+
+```powershell
+python ai_verifier.py --api-test "https://example.com/test.jpg"
+```
+
+最后打开相机测试AI阶段或完整流程：
+
+```powershell
+python main.py --stage ai
+python main.py
+```
+
+## 6. 提示词判断内容
+
+默认提示词要求AI区分：
+
+- `true`：至少一个人明显意外倒卧、异常坐卧在地板或地面上。
+- `false`：站立、行走、弯腰、下蹲、正常坐椅子、正常躺床或沙发。
+- `uncertain`：人体严重遮挡、画面模糊或无法判断人是在地面还是家具上。
+
+只允许三个短答案可减少输出Token、解析错误和响应时间。单张图片无法看到完整跌倒过程，所以它更适合确认“当前是否倒在地上”，不能单独证明之前是否发生了快速跌落。
+
+## 7. AI与本地结果如何融合
+
+| 当前情况 | 最终结果 |
+|---|---|
+| 没有API Key、断网、超时、接口报错 | 使用本地状态机 |
+| AI回答`uncertain`或格式错误 | 使用本地状态机 |
+| AI明确回答`true` | AI优先输出FALL并保持15秒 |
+| AI明确回答`false` | AI优先输出NO_FALL并保持3秒 |
+| AI结果过期且没有新回答 | 恢复使用本地状态机 |
+
+配置`ai.fusion.ai_can_clear_local_fall: true`允许AI的`false`短暂覆盖本地FALL，符合当前“AI回答为主”的要求。如果部署时更重视漏报安全，可改成`false`，此时AI不能解除本地已经确认的FALL。
+
+## 8. 后续语音接口
+
+`decision_fusion.py`已经提供`ExternalConfirmation`和`submit_external_confirmation()`。后续语音识别模型只需要把老人回答转换成统一结论：
+
+- “我没事”转换为`NO_FALL`；
+- “救命、起不来”转换为`FALL`；
+- 没听清或无回答转换为`UNCERTAIN`，不覆盖现有判断。
+
+`alert_manager.py`已经支持注册新的处理器，可在FALL状态变化时触发机器人停车、语音询问、通知家属或上传护理平台，不需要修改本地五维算法。

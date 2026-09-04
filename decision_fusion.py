@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-"""本地跌倒结果与AI复核结果融合模块。
+"""本地跌倒结果、视觉AI结果和后续外部确认的融合模块。
 
-融合规则保持保守和可解释：
-1. 本地状态机已经确认FALL时立即输出FALL，AI不能否决；
-2. 本地仍为NO_FALL但风险达到最低门槛时，高置信度AI可以辅助确认；
-3. 文本模型只读取本地结构化数据，触发门槛高于真正读取图片的视觉模型；
-4. AI超时、报错、不确定或结果过期时，最终结果完全退回本地判断；
-5. AI辅助确认后保持一段时间，避免网络结果只出现一帧就消失。
+默认策略符合当前项目要求：
+1. 没有可用AI结果时，完全使用本地FALL/NO_FALL；
+2. 视觉AI成功返回明确true/false后，在短暂有效期内以AI为主；
+3. AI超时、断网、报错、不确定或结果过期时，立即退回本地判断；
+4. AI判断FALL保持较长时间，AI判断NO_FALL只保持较短时间；
+5. ExternalConfirmation为后续语音识别、老人回答和人工确认预留。
 
-本文件不调用网络，也不计算P/H/V/S/C，只负责组合两个已经完成的结果。
+本模块不调用网络，也不重新计算P/H/V/S/C。
 """
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -20,14 +20,35 @@ import yaml
 
 from ai_verifier import (
     AI_FALL,
+    AI_NO_FALL,
     AIVerificationResult,
 )
 from fall_detector import FallDecision
 
 
 @dataclass
+class ExternalConfirmation:
+    """语音、护理人员或人工按钮以后都可转换成这一统一输入。"""
+
+    person_id: int
+    source: str
+    verdict: str
+    confidence: float
+    timestamp_s: float
+    ttl_s: float
+    reason: str = ""
+
+    def usable_at(self, now_s: float) -> bool:
+        """只有明确结论、置信度合格且未过期才允许参与融合。"""
+        return bool(
+            self.verdict in {AI_FALL, AI_NO_FALL}
+            and 0.0 <= float(now_s) - float(self.timestamp_s) <= float(self.ttl_s)
+        )
+
+
+@dataclass
 class FusionDecision:
-    """系统最终二值判断，同时保留本地和AI来源便于追溯。"""
+    """系统最终二值判断，并保留结论来源便于后续告警追溯。"""
 
     person_id: int
     is_fall: bool
@@ -43,14 +64,18 @@ class FusionDecision:
 
 @dataclass
 class _FusionMemory:
-    """一个人的AI辅助FALL保持时间和最后事件编号。"""
+    """保存最近一次有效AI结论和以后接入的语音/人工结论。"""
 
-    ai_fall_until_s: float = 0.0
-    last_ai_event_id: str = ""
+    ai_verdict: str = "NONE"
+    ai_confidence: float = 0.0
+    ai_event_id: str = ""
+    ai_reason: str = ""
+    ai_until_s: float = 0.0
+    external: Optional[ExternalConfirmation] = None
 
 
 class DecisionFusion:
-    """按Track ID融合本地二值状态和最新AI复核。"""
+    """按Track ID执行外部确认 > 视觉AI > 本地状态机的融合顺序。"""
 
     def __init__(self, config: dict):
         self.cfg = config["ai"]["fusion"]
@@ -62,79 +87,100 @@ class DecisionFusion:
             self.people[person_id] = _FusionMemory()
         return self.people[person_id]
 
-    def _ai_can_confirm(
+    def submit_external_confirmation(
         self,
-        local: FallDecision,
-        ai_result: Optional[AIVerificationResult],
+        confirmation: ExternalConfirmation,
     ) -> bool:
-        """检查AI结果、置信度和本地最低证据是否同时满足。"""
-        if ai_result is None or not ai_result.usable:
+        """预留入口：语音识别或人工确认模块以后从这里提交结果。"""
+        minimum = float(self.cfg["external_min_confidence"])
+        if float(confirmation.confidence) < minimum:
             return False
-        if ai_result.verdict != AI_FALL:
-            return False
-        if ai_result.confidence < float(self.cfg["min_ai_fall_confidence"]):
-            return False
+        self._person(confirmation.person_id).external = confirmation
+        return True
 
-        # 视觉模型看到了独立图像证据，因此允许较低的本地总分门槛。
-        # 当前文本模型只复核P/H/V/S/C，使用更高门槛避免重复证据被放大。
-        score_key = (
-            "vision_min_local_score"
-            if ai_result.includes_images
-            else "text_min_local_score"
+    def _remember_ai(
+        self,
+        memory: _FusionMemory,
+        ai_result: Optional[AIVerificationResult],
+        now_s: float,
+    ) -> None:
+        """只接收新的高置信度视觉结果，并按正负结论设置保持时间。"""
+        if ai_result is None or not ai_result.usable:
+            return
+        if not ai_result.includes_images:
+            return
+        if ai_result.event_id == memory.ai_event_id:
+            return
+        if ai_result.confidence < float(self.cfg["min_ai_confidence"]):
+            return
+
+        hold_key = (
+            "positive_hold_s"
+            if ai_result.verdict == AI_FALL
+            else "negative_hold_s"
         )
-        return bool(
-            max(local.fall_score, ai_result.peak_local_score)
-            >= float(self.cfg[score_key])
-            and max(local.pose_score, ai_result.peak_pose_score)
-            >= float(self.cfg["min_local_pose_score"])
-            and max(local.data_quality, ai_result.peak_data_quality)
-            >= float(self.cfg["min_local_data_quality"])
-        )
+        memory.ai_verdict = ai_result.verdict
+        memory.ai_confidence = float(ai_result.confidence)
+        memory.ai_event_id = ai_result.event_id
+        memory.ai_reason = ai_result.reason
+        memory.ai_until_s = float(now_s) + float(self.cfg[hold_key])
 
     def update(
         self,
         local: FallDecision,
         ai_result: Optional[AIVerificationResult],
         timestamp_s: float,
+        external_confirmation: Optional[ExternalConfirmation] = None,
     ) -> FusionDecision:
-        """输出系统最终FALL/NO_FALL；任何AI异常都不会阻塞本地结果。"""
+        """输出最终结果；AI不可用时本地判断不会暂停。"""
         person_id = int(local.person_id)
         now = float(timestamp_s)
         memory = self._person(person_id)
 
-        # 同一个AI事件只处理一次，防止每帧反复延长保持时间。
-        if (
-            ai_result is not None
-            and ai_result.event_id != memory.last_ai_event_id
-        ):
-            memory.last_ai_event_id = ai_result.event_id
-            if self._ai_can_confirm(local, ai_result):
-                memory.ai_fall_until_s = max(
-                    memory.ai_fall_until_s,
-                    now + float(self.cfg["positive_hold_s"]),
-                )
+        if external_confirmation is not None:
+            self.submit_external_confirmation(external_confirmation)
+        self._remember_ai(memory, ai_result, now)
 
-        ai_hold_active = bool(
-            memory.ai_fall_until_s > 0.0
-            and now <= memory.ai_fall_until_s
+        external = memory.external
+        external_active = bool(
+            external is not None
+            and external.usable_at(now)
+            and external.confidence >= float(self.cfg["external_min_confidence"])
         )
-        ai_verdict = ai_result.verdict if ai_result is not None else "NONE"
-        ai_confidence = ai_result.confidence if ai_result is not None else 0.0
-        ai_event_id = ai_result.event_id if ai_result is not None else ""
+        ai_active = bool(
+            memory.ai_until_s > 0.0
+            and now <= memory.ai_until_s
+            and memory.ai_verdict in {AI_FALL, AI_NO_FALL}
+        )
 
-        # 本地FALL优先级最高，AI无权将它改为NO_FALL。
-        if local.is_fall:
-            source = "LOCAL+AI" if ai_verdict == AI_FALL else "LOCAL"
-            reason = "本地五维状态机已经确认跌倒"
-            final_fall = True
-        elif ai_hold_active:
-            source = "AI_ASSISTED"
-            reason = "本地存在疑似证据，并获得高置信度AI复核支持"
-            final_fall = True
+        # 最高优先级留给将来的老人语音确认、护理人员确认或物理按钮。
+        if external_active and external is not None:
+            final_fall = external.verdict == AI_FALL
+            source = f"{external.source.upper()}_PRIMARY"
+            reason = external.reason or "外部确认结果优先"
+        elif ai_active:
+            if memory.ai_verdict == AI_FALL:
+                final_fall = True
+                source = "AI_PRIMARY"
+                reason = memory.ai_reason or "视觉AI判断有人跌倒"
+            elif bool(self.cfg["ai_can_clear_local_fall"]):
+                final_fall = False
+                source = "AI_PRIMARY"
+                reason = memory.ai_reason or "视觉AI判断未发生跌倒"
+            else:
+                final_fall = bool(local.is_fall)
+                source = "LOCAL_SAFETY" if local.is_fall else "AI_PRIMARY"
+                reason = (
+                    "本地已确认FALL，安全配置禁止AI直接解除"
+                    if local.is_fall
+                    else memory.ai_reason or "视觉AI判断未发生跌倒"
+                )
         else:
-            source = "LOCAL_ONLY"
-            reason = "本地状态机未确认跌倒"
-            final_fall = False
+            final_fall = bool(local.is_fall)
+            source = "LOCAL_FALLBACK"
+            reason = (
+                "AI不可用或没有有效结果，使用本地状态机判断"
+            )
 
         return FusionDecision(
             person_id=person_id,
@@ -143,19 +189,19 @@ class DecisionFusion:
             source=source,
             local_is_fall=bool(local.is_fall),
             local_fall_score=float(local.fall_score),
-            ai_verdict=ai_verdict,
-            ai_confidence=float(ai_confidence),
-            ai_event_id=ai_event_id,
+            ai_verdict=memory.ai_verdict if ai_active else "NONE",
+            ai_confidence=memory.ai_confidence if ai_active else 0.0,
+            ai_event_id=memory.ai_event_id if ai_active else "",
             reason=reason,
         )
 
     def reset_person(self, person_id: int) -> None:
-        """清除离场Track ID的AI辅助状态。"""
+        """清除离场Track ID的AI和外部确认状态。"""
         self.people.pop(int(person_id), None)
 
 
 def run_self_test(config: dict) -> None:
-    """验证本地优先、文本AI辅助、低置信度忽略和保持时间。"""
+    """验证AI优先、断网本地降级、正负保持和语音预留入口。"""
     fusion = DecisionFusion(config)
 
     def local_decision(is_fall: bool, score: float) -> FallDecision:
@@ -176,52 +222,65 @@ def run_self_test(config: dict) -> None:
             degraded_mode=False,
         )
 
-    ai_fall = AIVerificationResult(
-        event_id="event-1",
+    def ai_result(event_id: str, verdict: str) -> AIVerificationResult:
+        return AIVerificationResult(
+            event_id=event_id,
+            person_id=1,
+            success=True,
+            verdict=verdict,
+            confidence=1.0,
+            risk_level="high" if verdict == AI_FALL else "low",
+            reason="视觉模型测试结论",
+            observations=(),
+            requested_s=0.0,
+            completed_s=0.1,
+            latency_s=0.1,
+            model="test-vision-model",
+            includes_images=True,
+            peak_local_score=0.50,
+            peak_pose_score=0.90,
+            peak_data_quality=0.95,
+            raw_answer="true" if verdict == AI_FALL else "false",
+        )
+
+    # 没有AI时，本地FALL必须继续输出，证明断网不会让系统停止判断。
+    local_only = fusion.update(local_decision(True, 0.80), None, 0.0)
+    assert local_only.is_fall and local_only.source == "LOCAL_FALLBACK"
+
+    # 有明确视觉AI结果时，默认按用户要求由AI覆盖本地结果。
+    ai_no_fall = fusion.update(
+        local_decision(True, 0.80),
+        ai_result("event-no-fall", AI_NO_FALL),
+        1.0,
+    )
+    assert not ai_no_fall.is_fall and ai_no_fall.source == "AI_PRIMARY"
+
+    ai_fall = fusion.update(
+        local_decision(False, 0.50),
+        ai_result("event-fall", AI_FALL),
+        5.0,
+    )
+    assert ai_fall.is_fall and ai_fall.source == "AI_PRIMARY"
+
+    # 语音/人工确认接口优先级高于AI，供下一阶段直接接入。
+    voice = ExternalConfirmation(
         person_id=1,
-        success=True,
-        verdict=AI_FALL,
+        source="VOICE",
+        verdict=AI_NO_FALL,
         confidence=0.95,
-        risk_level="high",
-        reason="连续异常",
-        observations=("P较高",),
-        requested_s=0.0,
-        completed_s=0.1,
-        latency_s=0.1,
-        model="test-model",
-        includes_images=False,
-        peak_local_score=0.70,
-        peak_pose_score=0.90,
-        peak_data_quality=0.95,
+        timestamp_s=6.0,
+        ttl_s=10.0,
+        reason="老人清楚回答自己没有跌倒",
     )
-
-    local_only = fusion.update(local_decision(False, 0.20), None, 0.0)
-    assert not local_only.is_fall
-
-    low_risk_fusion = DecisionFusion(config)
-    low_risk_ai = replace(
-        ai_fall,
-        event_id="event-low-risk",
-        peak_local_score=0.20,
-        peak_pose_score=0.20,
+    voice_result = fusion.update(
+        local_decision(True, 0.90),
+        None,
+        6.0,
+        external_confirmation=voice,
     )
-    ignored_ai = low_risk_fusion.update(
-        local_decision(False, 0.20),
-        low_risk_ai,
-        0.5,
-    )
-    assert not ignored_ai.is_fall
-
-    ai_assisted = fusion.update(local_decision(False, 0.70), ai_fall, 1.0)
-    assert ai_assisted.is_fall and ai_assisted.source == "AI_ASSISTED"
-
-    held = fusion.update(local_decision(False, 0.10), ai_fall, 2.0)
-    assert held.is_fall
-
-    local_fall = fusion.update(local_decision(True, 0.90), None, 3.0)
-    assert local_fall.is_fall and local_fall.source == "LOCAL"
+    assert not voice_result.is_fall and voice_result.source == "VOICE_PRIMARY"
     print("decision_fusion self-test: PASS")
-    print("  local priority, AI-assisted confirmation, positive hold=PASS")
+    print("  AI primary, offline local fallback, hold time and voice interface=PASS")
 
 
 def load_config(path: str) -> dict:
@@ -231,8 +290,8 @@ def load_config(path: str) -> dict:
 
 
 def main() -> None:
-    """--self-test独立验证融合规则；默认复用main.py打开AI窗口。"""
-    parser = argparse.ArgumentParser(description="本地与AI跌倒结果融合")
+    """--self-test独立测试；默认复用main.py打开AI窗口。"""
+    parser = argparse.ArgumentParser(description="本地、AI和外部确认融合")
     parser.add_argument(
         "--config",
         default=str(Path(__file__).resolve().parent / "config.yaml"),

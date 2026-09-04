@@ -175,68 +175,52 @@ fall_detector:                              # fall_detector.py：只做五项加
     stale_person_s: 5.0                     # ID离开画面后清空全部历史的时间
 
 #--------------------------------------ai-------------------------------------#
-ai:                                         # ai_verifier.py：事件触发的豆包异步复核
-  enabled: true                             # 是否启用AI；关闭或缺少密钥时本地检测仍正常运行
-  provider: volcengine_ark                  # AI服务提供方标识，为后续更换服务预留
-  base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟兼容OpenAI的API根地址
-   # API密钥环境变量名，密钥本身绝不能写入本文件  终端运行 ,  $env:ARK_API_KEY="你的API密钥"
-  api_key_env: ARK_API_KEY
-  api_key: "ark-39c88c0a-d31c-4496-a1e9-a5900df16eab-34585"                 
-  model: doubao-seed-evolving              # 当前文本模型；只读取本地结构化检测数据
-  supports_vision: true                     # 当前模型不能看图；以后换视觉模型时改为true
-  request:                                  # 单次网络请求和后台任务参数
-    timeout_s: 5.0                          # 请求最长等待时间，超时后立即退回本地判断
-    max_tokens: 50                         # AI结构化回答最大Token数
-    temperature: 0.0                        # 0表示回答更稳定，适合固定JSON判断任务
-    thinking_enabled: false                 # 新增：是否启用深度思考
-    # 如果模型支持 reasoning_effort，可添加：
-    # reasoning_effort: medium              # low/medium/high
-    force_json_response: false              # 是否发送JSON响应格式参数；旧模型不支持时保持false
-    max_workers: 1                          # 后台AI线程数，1可避免同时请求过多占用带宽
-    max_pending_requests: 2                 # 最多允许多少个未完成请求，队列满时跳过新请求
-  # ====== 新增以下内容 ======
-  prompt:
-    prompt:
+ai:                                         # ai_verifier.py：本地疑似后异步上传一张图片
+  enabled: true                             # 是否启用AI；关闭、缺少密钥或断网时直接使用本地判断
+  provider: volcengine_ark                  # 服务提供方标识，后续更换AI厂商时用于选择适配器
+  base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟OpenAI兼容API根地址
+  api_key_env: ARK_API_KEY                  # 推荐使用的环境变量名
+  api_key: "ark-39c88c0a-d31c-4496-a1e9-a5900df16eab-34585"         # 可选明文密钥；只在本机填写，提交或发给别人前必须清空
+  model: doubao-seed-evolving               # 模型或ep接入点ID；必须先在方舟控制台开通视觉能力
+  supports_vision: true                     # 本流程必须为true，因为每次请求都会上传一张图片
+  request:                                  # Responses API与后台线程参数
+    timeout_s: 6.0                          # 单次调用最长等待秒数；超时不影响本地检测
+    max_output_tokens: 50                   # true/false回答只需要很少Token
+    temperature: 0.0                        # 0使相同图片的回答更稳定
+    top_p: 1.0                              # 核采样范围；固定判断任务保持1.0即可
+    thinking_enabled: false                 # 关闭深度思考可降低视觉判断延迟
+    extra_headers: {}                       # 预留额外HTTP请求头，一般保持空字典
+    max_workers: 1                          # 后台AI线程数，1可限制带宽和并发费用
+    max_pending_requests: 1                 # 最多保留一个未完成请求，队列满时跳过新请求
+  prompt:                                   # 发给视觉模型的任务说明和回答格式
+    include_local_evidence: false           # false表示AI独立看图，避免被本地分数诱导
+    plain_boolean_confidence: 1.0            # 模型只答true/false时映射的内部置信度
     text: |
-      你是一位跌倒检测专家。根据这张单帧图片，判断图片中是否存在任何一个人躺在地面（硬地板、地砖等）上，而不是在床上、沙发、椅子等家具上，
-      并且姿态异常（非受控的坐下、蹲下、弯腰等）。
-
-      规则：
-      - 如果图片中有任何一个人躺或坐在地上（非家具），且姿态不正常，回答：true。
-      - 如果所有人都在家具上，或所有人姿态正常（站立、行走、正常坐下、蹲下等），回答：false。
-      - 只要存在一个人符合跌倒条件，就回答 true。
-
-      只输出 true 或 false，不要其他内容。
-
-      请分析图片。
-    image_url: ""   # 测试时可留空，实际使用时由代码动态传入
-  # ==========================
-
-  trigger:                                  # 哪些本地事件需要调用AI，不采用固定每秒上传
-    fall_score: 0.45                        # 本地总分达到该值后开始积累AI触发帧
-    min_pose_score: 0.50                    # AI触发还要求P至少达到该值
-    min_data_quality: 0.35                  # 数据质量低于该值时不浪费AI请求
-    consecutive_frames: 3                   # 疑似风险连续多少帧后提交；本地FALL可立即提交
-    cooldown_s: 5.0                         # 同一人员两次AI请求的最小间隔，单位秒
-    fall_recheck_s: 20.0                    # 本地已确认FALL后的AI重复复核间隔，单位秒
-    result_ttl_s: 15.0                      # AI结果最多参与融合多久，单位秒
-  buffer:                                   # 每个人的短时事件缓冲区
-    duration_s: 5.0                         # 保存触发前后最近多少秒的数据
-    sample_interval_s: 0.50                 # 缓冲采样间隔；0.5表示约每秒保存2条
-    max_frames_per_person: 12               # 每个Track ID最多保存多少条观测
-    keyframe_count: 4                       # 一次AI复核选择多少个时间点
-    crop_margin_ratio: 0.20                 # 视觉模型人体裁剪框四周额外保留的比例
-    jpeg_quality: 80                        # 视觉模型JPEG压缩质量，越高越清晰但上传更大
-  network:                                  # 网络失败后的指数退避，避免断网时不断重试
-    backoff_initial_s: 3.0                  # 第一次失败后暂停请求时间，单位秒
-    backoff_max_s: 60.0                     # 连续失败时最长暂停时间，单位秒
-  fusion:                                   # decision_fusion.py：本地和AI最终融合规则
-    min_ai_fall_confidence: 0.80            # AI辅助确认FALL所需最低置信度
-    text_min_local_score: 0.55              # 文本AI只复核本地数据，因此要求较高本地总分
-    vision_min_local_score: 0.40            # 视觉AI具有独立图像证据时允许较低本地总分
-    min_local_pose_score: 0.55              # AI辅助确认仍要求本地姿态P明显异常
-    min_local_data_quality: 0.35            # AI不能放大质量过低的本地误测
-    positive_hold_s: 15.0                   # AI辅助确认后保持FALL的时间，单位秒
+      你是服务机器人跌倒检测复核器。请只根据这一张图片判断：画面中是否有人意外跌倒、倒卧或异常坐卧在地板、地砖等地面上。
+      正常站立、行走、弯腰、下蹲、正常坐在椅子上，以及正常躺在床或沙发上，都不是跌倒。
+      单张图片证据不足、人体被严重遮挡或无法分清地面与家具时，回答 uncertain。
+      发现至少一人明显跌倒在地面回答 true；明确没有跌倒回答 false。
+      只能输出 true、false 或 uncertain，不要解释，不要添加标点。
+  trigger:                                  # 本地结果何时触发一次单图上传
+    fall_score: 0.50                        # 本地FallScore达到0.50时触发AI复核
+    consecutive_frames: 1                   # 1表示达到阈值立即提交，调大可减少瞬时误触发
+    cooldown_s: 5.0                         # 同一人持续疑似时最短复查间隔，单位秒
+    fall_recheck_s: 10.0                    # 本地已经FALL时的最短AI复查间隔，单位秒
+    result_ttl_s: 20.0                      # 最新明确AI结果可被融合层读取的最长时间
+  image:                                    # main.py上传前的单张图片处理参数
+    mode: full_frame                        # full_frame保留完整场景；person_context只截人体附近
+    max_long_side_px: 640                   # 最长边超过640才等比例缩小，绝不放大
+    jpeg_quality: 75                        # JPEG质量1～100；75兼顾人体细节、速度和流量
+    crop_margin_ratio: 0.50                 # person_context模式下人体框四周保留50%场景
+  network:                                  # 失败后暂停调用，断网期间不反复占用线程
+    backoff_initial_s: 3.0                  # 第一次失败后跳过AI的秒数
+    backoff_max_s: 60.0                     # 连续失败时最大退避秒数
+  fusion:                                   # decision_fusion.py：明确AI回答优先，本地负责降级
+    min_ai_confidence: 0.60                 # AI结果达到该内部置信度才允许覆盖本地结果
+    ai_can_clear_local_fall: true            # true允许AI的false短暂覆盖本地FALL；安全优先可改false
+    positive_hold_s: 15.0                   # AI=true后保持FALL的秒数
+    negative_hold_s: 3.0                    # AI=false后保持NO_FALL的秒数，宜短于正结果
+    external_min_confidence: 0.80           # 后续语音或人工确认进入融合层的最低置信度
 
 #--------------------------------------alerts-------------------------------------#
 alerts:                                     # alert_manager.py：后续机器人动作和通知统一入口

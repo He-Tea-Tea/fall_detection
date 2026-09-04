@@ -1,27 +1,20 @@
 # -*- coding: utf-8 -*-
-"""豆包AI跌倒复核模块。
+"""豆包视觉模型单图跌倒复核模块。
 
-本文件负责四件事：
-1. 按Track ID保存最近几秒的本地检测结果；
-2. 本地风险达到配置阈值时，生成一次AI复核事件；
-3. 在后台线程调用火山方舟兼容Chat API，不阻塞相机主循环；
-4. 把模型返回内容解析成统一的FALL、NO_FALL或UNCERTAIN结果。
+本文件只负责AI复核，不计算本地P/H/V/S/C：
+1. 本地FallScore达到配置阈值后，为当前人员创建一次单图复核请求；
+2. 使用后台线程调用火山方舟Responses API，避免网络等待卡住相机；
+3. 把模型回答统一转换成FALL、NO_FALL或UNCERTAIN；
+4. 请求失败、超时或断网时返回失败结果，主流程自动继续使用本地判断；
+5. 保留统一结果结构，后续语音识别、人工确认可接入decision_fusion.py。
 
-当前配置模型doubao-1-5-pro-32k-250115是文本模型，因此本版主要发送
-P/H/V/S/C、人体角度、髋高、下降速度、静止时间和场景关系。代码已经
-预留多帧JPEG输入；以后改用视觉模型时，只需修改config.yaml中的模型名，
-并把supports_vision改为true，不需要重写main.py调用流程。
-
-安全原则：
-- API密钥只从环境变量读取，绝不写进代码或config.yaml；
-- 网络错误、超时、模型错误都不会中断本地跌倒检测；
-- AI只返回复核意见，最终是否报警由decision_fusion.py统一决定；
-- 同一人员使用事件触发和冷却时间，避免每帧重复请求产生费用。
+本版每次请求只上传一张图片，不再上传多帧序列。上传时机由
+AIFallCoordinator控制，图片的裁剪、缩放和JPEG压缩由main.py完成。
 """
 
 import argparse
 import base64
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
@@ -29,9 +22,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
-from urllib import error as urllib_error
-from urllib import request as urllib_request
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import yaml
@@ -43,7 +34,7 @@ AI_UNCERTAIN = "UNCERTAIN"
 
 @dataclass
 class AIFrameObservation:
-    """一个人在某个时间点的本地测量，可选保存对应人体区域JPEG。"""
+    """触发时刻的一人本地测量，以及本次唯一上传的JPEG图片。"""
 
     person_id: int
     timestamp_s: float
@@ -68,18 +59,15 @@ class AIFrameObservation:
 
     @staticmethod
     def _number(value: Optional[float]) -> Optional[float]:
-        """把有效数字保留三位小数，无效数字转换成JSON的null。"""
+        """有效数字保留三位小数，无效值转成JSON的null。"""
         if value is None or not np.isfinite(value):
             return None
         return round(float(value), 3)
 
-    def to_prompt_dict(self, first_timestamp_s: float) -> dict:
-        """转换成发送给AI的精简字典，不包含二进制图片。"""
+    def to_prompt_dict(self) -> dict:
+        """转换为可选的本地辅助信息，不包含图片二进制。"""
         return {
-            "time_from_first_s": round(
-                float(self.timestamp_s) - float(first_timestamp_s),
-                3,
-            ),
+            "person_id": int(self.person_id),
             "local_label": str(self.local_label),
             "local_fall_score": self._number(self.local_fall_score),
             "P_pose": self._number(self.pose_score),
@@ -102,19 +90,21 @@ class AIFrameObservation:
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class AIVerificationRequest:
-    """一次不可变的AI复核请求；frames按时间从早到晚排列。"""
+    """一次单图请求；frame.image_jpeg必须只包含当前这一张图片。"""
 
     event_id: str
     person_id: int
     created_s: float
-    frames: Tuple[AIFrameObservation, ...]
+    frame: AIFrameObservation
+    image_url: str = ""
+    image_mime_type: str = "image/jpeg"
 
 
 @dataclass
 class AIVerificationResult:
-    """统一AI复核结果；success=False时不能参与最终判断。"""
+    """统一AI结果；success=False或UNCERTAIN时由融合层退回本地判断。"""
 
     event_id: str
     person_id: int
@@ -132,20 +122,21 @@ class AIVerificationResult:
     peak_local_score: float
     peak_pose_score: float
     peak_data_quality: float
+    raw_answer: str = ""
     error: str = ""
 
     @property
     def usable(self) -> bool:
-        """只有成功解析出的三种标准结论才允许进入融合层。"""
+        """只有成功得到明确FALL/NO_FALL的结果才覆盖本地结论。"""
         return bool(
             self.success
-            and self.verdict in {AI_FALL, AI_NO_FALL, AI_UNCERTAIN}
+            and self.verdict in {AI_FALL, AI_NO_FALL}
         )
 
 
 @dataclass
 class AIPersonStatus:
-    """main.py用于画面显示的AI运行状态。"""
+    """main.py画面显示使用的AI运行状态。"""
 
     state: str
     result: Optional[AIVerificationResult]
@@ -153,276 +144,214 @@ class AIPersonStatus:
     detail: str
 
 
-class AIEventBuffer:
-    """按Track ID保存短时间序列，并从中选择有代表性的关键帧。"""
-
-    def __init__(self, config: dict):
-        self.cfg = config["ai"]["buffer"]
-        self.duration_s = float(self.cfg["duration_s"])
-        self.sample_interval_s = float(self.cfg["sample_interval_s"])
-        self.keyframe_count = int(self.cfg["keyframe_count"])
-        self.max_frames = int(self.cfg["max_frames_per_person"])
-        if self.duration_s <= 0.0 or self.sample_interval_s <= 0.0:
-            raise ValueError("ai.buffer的时长和采样间隔必须大于0")
-        if self.keyframe_count <= 0 or self.max_frames < self.keyframe_count:
-            raise ValueError("ai.buffer最大帧数不能小于关键帧数量")
-        self.people: Dict[int, Deque[AIFrameObservation]] = defaultdict(
-            lambda: deque(maxlen=self.max_frames)
-        )
-        self.last_sample_s: Dict[int, float] = {}
-
-    def should_capture_image(self, person_id: int, timestamp_s: float) -> bool:
-        """告诉main.py本帧是否值得编码JPEG，减少不必要的CPU消耗。"""
-        last_sample = self.last_sample_s.get(int(person_id))
-        return bool(
-            last_sample is None
-            or float(timestamp_s) - last_sample >= self.sample_interval_s
-        )
-
-    def add(self, observation: AIFrameObservation) -> bool:
-        """按采样间隔保存观测；返回True表示本帧已进入缓冲区。"""
-        person_id = int(observation.person_id)
-        now = float(observation.timestamp_s)
-        last_sample = self.last_sample_s.get(person_id)
-        if (
-            last_sample is not None
-            and now - last_sample < self.sample_interval_s
-        ):
-            return False
-
-        history = self.people[person_id]
-        history.append(observation)
-        self.last_sample_s[person_id] = now
-
-        # maxlen限制条数，duration_s进一步限制真实时间跨度。
-        while history and now - history[0].timestamp_s > self.duration_s:
-            history.popleft()
-        return True
-
-    def _keyframe_indices(self, frames: Sequence[AIFrameObservation]) -> List[int]:
-        """优先保留最早、风险最高和最新帧，再均匀补足其他帧。"""
-        frame_count = len(frames)
-        if frame_count <= self.keyframe_count:
-            return list(range(frame_count))
-
-        selected = {0, frame_count - 1}
-        peak_index = max(
-            range(frame_count),
-            key=lambda index: frames[index].local_fall_score,
-        )
-        selected.add(peak_index)
-
-        # 均匀候选保证AI能看见事件发展过程，而不是只看最高分一帧。
-        evenly_spaced = np.linspace(
-            0,
-            frame_count - 1,
-            num=self.keyframe_count,
-        ).round().astype(int)
-        for index in evenly_spaced:
-            selected.add(int(index))
-            if len(selected) >= self.keyframe_count:
-                break
-
-        # 如果均匀点与峰值重复，从中间向两侧继续补足。
-        if len(selected) < self.keyframe_count:
-            for index in range(1, frame_count - 1):
-                selected.add(index)
-                if len(selected) >= self.keyframe_count:
-                    break
-        return sorted(selected)[: self.keyframe_count]
-
-    def build_request(
-        self,
-        person_id: int,
-        created_s: float,
-    ) -> Optional[AIVerificationRequest]:
-        """从指定人员缓冲区构建一次AI请求，没有观测时返回None。"""
-        frames = list(self.people.get(int(person_id), ()))
-        if not frames:
-            return None
-        selected = tuple(frames[index] for index in self._keyframe_indices(frames))
-        event_id = f"person-{int(person_id)}-{int(float(created_s) * 1000)}"
-        return AIVerificationRequest(
-            event_id=event_id,
-            person_id=int(person_id),
-            created_s=float(created_s),
-            frames=selected,
-        )
-
-    def reset_person(self, person_id: int) -> None:
-        """清除离场人员的图片和结构化历史。"""
-        self.people.pop(int(person_id), None)
-        self.last_sample_s.pop(int(person_id), None)
-
-
-class ArkChatClient:
-    """使用标准库调用火山方舟兼容Chat Completions接口。"""
+class ArkResponsesClient:
+    """按用户验证过的OpenAI SDK写法调用火山方舟Responses API。"""
 
     def __init__(
         self,
         config: dict,
-        transport: Optional[Callable[[dict], dict]] = None,
+        transport: Optional[Callable[[dict], object]] = None,
     ):
         self.cfg = config["ai"]
-        self.model = str(self.cfg["model"])
+        self.model = str(self.cfg["model"]).strip()
         self.base_url = str(self.cfg["base_url"]).rstrip("/")
-        self.api_key_env = str(self.cfg["api_key_env"])
-        self.supports_vision = bool(self.cfg["supports_vision"])
+        self.api_key_env = str(self.cfg.get("api_key_env", "ARK_API_KEY"))
+        self.supports_vision = bool(self.cfg.get("supports_vision", True))
         self.transport = transport
-
-    # @property
-    # def api_key(self) -> str:
-    #     """优先读取config.yaml中的密钥；没有填写时再读取环境变量。"""
-    #     config_key = str(self.cfg.get("api_key", "")).strip()
-    #     if config_key:
-    #         return config_key
-        # return os.environ.get(self.api_key_env, "").strip()
+        self._sdk_client = None
+        self._sdk_client_key = ""
 
     @property
     def api_key(self) -> str:
-        # 直接取，不提前转 str
-        config_key = self.cfg.get("api_key")
-        # 判断：既不是 None，也不是空字符串，并且去除空格后还有内容
-        if config_key is not None and str(config_key).strip():
-            return str(config_key).strip()
-        # 回退到环境变量
+        """优先读取用户填写的ai.api_key，留空时再读取环境变量。"""
+        config_key = str(self.cfg.get("api_key", "")).strip()
+        if config_key:
+            return config_key
         return os.environ.get(self.api_key_env, "").strip()
 
     @property
     def ready(self) -> bool:
-        """测试transport或真实API密钥任一存在即可发起请求。"""
+        """离线测试transport或真实API Key存在时才允许提交。"""
         return self.transport is not None or bool(self.api_key)
 
-    def _prompt(self, request: AIVerificationRequest) -> str:
-        """把本地时间序列整理成明确、可解析的跌倒复核任务。"""
-        first_timestamp = request.frames[0].timestamp_s
-        sequence = [
-            frame.to_prompt_dict(first_timestamp)
-            for frame in request.frames
-        ]
-        payload = {
-            "task": "fall_verification",
-            "person_id": request.person_id,
-            "definitions": {
-                "P": "姿态风险，越接近水平越高",
-                "H": "髋部下降或绝对低高度风险",
-                "V": "快速向下运动风险",
-                "S": "异常姿态后持续静止风险",
-                "C": "地面比床、沙发等场景更危险",
-                "score_range": "所有风险分为0到1",
-            },
-            "chronological_observations": sequence,
-        }
-        return (
-            "请根据以下按时间排序的本地跌倒检测数据进行二次复核。"
-            "不要把单帧水平姿态直接认定为跌倒，要区分跌倒、坐下、弯腰、"
-            "床或沙发上正常躺卧以及证据不足。无效维度已经从valid_dimensions"
-            "中移除，不能把缺失数据当成正常证据。只输出一个JSON对象，格式为："
-            '{"verdict":"fall|no_fall|uncertain","confidence":0到1,'
-            '"risk_level":"high|medium|low","reason":"简短中文原因",'
-            '"observations":["关键证据1","关键证据2"]}。\n'
-            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        )
+    def _prompt_text(self, observation: AIFrameObservation) -> str:
+        """读取统一提示词；可选附加本地分数，但默认让AI独立看图。"""
+        prompt_cfg = self.cfg.get("prompt") or {}
+        prompt_text = str(prompt_cfg.get("text", "")).strip()
+        if not prompt_text:
+            raise ValueError("config.yaml中ai.prompt.text不能为空")
+        if bool(prompt_cfg.get("include_local_evidence", False)):
+            local_data = json.dumps(
+                observation.to_prompt_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            prompt_text += f"\n本地检测辅助数据：{local_data}"
+        return prompt_text
 
-    def _messages(self, request: AIVerificationRequest) -> Tuple[List[dict], bool]:
-        """构建兼容OpenAI格式的消息；视觉模式会追加Base64 JPEG。"""
-        system_text = (
-            "你是服务机器人跌倒检测的保守复核器。你只能根据输入证据判断，"
-            "证据冲突或不足必须输出uncertain。不要输出JSON以外的文字。"
-        )
-        prompt = self._prompt(request)
-        image_frames = [
-            frame
-            for frame in request.frames
-            if frame.image_jpeg
-        ]
-        includes_images = bool(self.supports_vision and image_frames)
+    @staticmethod
+    def _image_data_url(image_bytes: bytes, mime_type: str) -> str:
+        """把本地图片字节编码为Responses API可接收的Data URL。"""
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 
-        if includes_images:
-            content: List[dict] = [{"type": "text", "text": prompt}]
-            for frame in image_frames:
-                encoded = base64.b64encode(frame.image_jpeg).decode("ascii")
-                content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{encoded}",
-                        },
-                    }
-                )
-            user_content = content
+    def build_payload(self, request: AIVerificationRequest) -> dict:
+        """构建Responses API参数，每个请求严格只放一张图片。"""
+        if not self.supports_vision:
+            raise RuntimeError("ai.supports_vision必须为true才能上传图片")
+        if request.frame.image_jpeg:
+            image_url = self._image_data_url(
+                request.frame.image_jpeg,
+                request.image_mime_type,
+            )
+        elif request.image_url:
+            image_url = request.image_url
         else:
-            user_content = prompt
+            raise ValueError("AI单图请求中没有有效图片")
 
-        messages = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_content},
-        ]
-        return messages, includes_images
-
-    def _http_post(self, payload: dict) -> dict:
-        """执行一次HTTPS POST；任何异常都交给上层转换成失败结果。"""
-        request_url = f"{self.base_url}/chat/completions"
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        http_request = urllib_request.Request(
-            request_url,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
+        user_content = [
+            {"type": "input_image", "image_url": image_url},
+            {
+                "type": "input_text",
+                "text": self._prompt_text(request.frame),
             },
-            method="POST",
-        )
-        timeout_s = float(self.cfg["request"]["timeout_s"])
+        ]
+        request_cfg = self.cfg["request"]
+        return {
+            "model": self.model,
+            "input": [{"role": "user", "content": user_content}],
+            "max_output_tokens": int(request_cfg["max_output_tokens"]),
+            "temperature": float(request_cfg["temperature"]),
+            "top_p": float(request_cfg.get("top_p", 1.0)),
+            "extra_body": {
+                "thinking": {
+                    "type": (
+                        "enabled"
+                        if bool(request_cfg.get("thinking_enabled", False))
+                        else "disabled"
+                    )
+                }
+            },
+            "extra_headers": request_cfg.get("extra_headers", {}) or {},
+        }
+
+    def _request_api(self, payload: dict) -> object:
+        """执行一次同步SDK调用；在线程序会在线程池中调用这里。"""
+        if self.transport is not None:
+            return self.transport(payload)
+
+        # 延迟导入使无API环境仍可运行本地检测与--self-test。
         try:
-            with urllib_request.urlopen(http_request, timeout=timeout_s) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib_error.HTTPError as error:
-            response_text = error.read().decode("utf-8", errors="replace")[:500]
-            raise RuntimeError(f"HTTP {error.code}: {response_text}") from error
-        except urllib_error.URLError as error:
-            raise RuntimeError(f"NETWORK_ERROR: {error.reason}") from error
+            from openai import OpenAI
+        except ImportError as error:
+            raise RuntimeError(
+                "未安装openai，请执行：python -m pip install -U openai"
+            ) from error
+
+        # 复用SDK客户端和HTTP连接，降低连续复核时的握手开销。
+        current_key = self.api_key
+        if self._sdk_client is None or self._sdk_client_key != current_key:
+            self._sdk_client = OpenAI(
+                base_url=self.base_url,
+                api_key=current_key,
+                timeout=float(self.cfg["request"]["timeout_s"]),
+                max_retries=0,
+            )
+            self._sdk_client_key = current_key
+        return self._sdk_client.responses.create(**payload)
 
     @staticmethod
-    def _extract_message_text(response: dict) -> str:
-        """兼容字符串content和部分服务返回的分段content。"""
-        choices = response.get("choices") or []
-        if not choices:
-            raise ValueError("API响应中没有choices")
-        content = (choices[0].get("message") or {}).get("content")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts = [
-                str(item.get("text", ""))
-                for item in content
+    def _extract_answer_text(response: object) -> str:
+        """兼容SDK对象和测试字典，从Responses API结果中提取文本。"""
+        output_text = (
+            response.get("output_text")
+            if isinstance(response, dict)
+            else getattr(response, "output_text", None)
+        )
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        output = (
+            response.get("output", [])
+            if isinstance(response, dict)
+            else getattr(response, "output", [])
+        ) or []
+        for item in output:
+            content = (
+                item.get("content", [])
                 if isinstance(item, dict)
-            ]
-            return "".join(parts).strip()
-        raise ValueError("API响应中没有可解析的message.content")
+                else getattr(item, "content", [])
+            ) or []
+            for content_item in content:
+                text = (
+                    content_item.get("text")
+                    if isinstance(content_item, dict)
+                    else getattr(content_item, "text", None)
+                )
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        raise ValueError("Responses API响应中没有可解析文本")
 
     @staticmethod
-    def _parse_model_json(text: str) -> dict:
-        """解析严格JSON，同时兼容模型偶尔返回的Markdown代码块。"""
+    def _strip_code_block(text: str) -> str:
+        """移除模型偶尔附加的Markdown代码块标记。"""
         cleaned = text.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned.strip()
+
+    def _parse_answer(self, text: str) -> Tuple[str, float, str, Tuple[str, ...]]:
+        """兼容测试文件的true/false，也支持以后扩展为JSON回答。"""
+        cleaned = self._strip_code_block(text)
+        normalized = cleaned.lower().rstrip("。.!！")
+        boolean_confidence = float(
+            self.cfg.get("prompt", {}).get("plain_boolean_confidence", 1.0)
+        )
+        if normalized == "true":
+            return AI_FALL, boolean_confidence, "视觉模型判断有人跌倒", ()
+        if normalized == "false":
+            return AI_NO_FALL, boolean_confidence, "视觉模型未发现跌倒", ()
+        if normalized in {"uncertain", "unknown", "不确定"}:
+            return AI_UNCERTAIN, 0.0, "视觉证据不足", ()
+
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-            if match is None:
-                raise ValueError("模型没有返回JSON对象")
-            return json.loads(match.group(0))
+            model_data = json.loads(cleaned)
+        except json.JSONDecodeError as error:
+            raise ValueError("模型必须只回答true、false或JSON对象") from error
+        if not isinstance(model_data, dict):
+            raise ValueError("模型JSON回答必须是对象")
+
+        if "is_fall" in model_data:
+            value = model_data["is_fall"]
+            if isinstance(value, bool):
+                verdict = AI_FALL if value else AI_NO_FALL
+            else:
+                verdict = self._normalize_verdict(value)
+        else:
+            verdict = self._normalize_verdict(model_data.get("verdict"))
+        confidence = float(
+            np.clip(
+                float(model_data.get("confidence", boolean_confidence)),
+                0.0,
+                1.0,
+            )
+        )
+        reason = str(model_data.get("reason", "视觉模型已完成判断"))
+        observations = model_data.get("observations") or []
+        if not isinstance(observations, list):
+            observations = [str(observations)]
+        return verdict, confidence, reason, tuple(str(item) for item in observations[:5])
 
     @staticmethod
     def _normalize_verdict(value: object) -> str:
-        """把模型可能返回的中英文结论统一为三个标准值。"""
+        """把JSON中可能出现的中英文结论统一为三种标准值。"""
         normalized = str(value).strip().lower().replace("-", "_")
         mappings = {
+            "true": AI_FALL,
             "fall": AI_FALL,
             "跌倒": AI_FALL,
+            "false": AI_NO_FALL,
             "no_fall": AI_NO_FALL,
             "normal": AI_NO_FALL,
             "未跌倒": AI_NO_FALL,
@@ -434,39 +363,19 @@ class ArkChatClient:
         return mappings.get(normalized, AI_UNCERTAIN)
 
     def verify(self, request: AIVerificationRequest) -> AIVerificationResult:
-        """同步执行一次AI复核；正常在线流程由后台线程调用本方法。"""
+        """同步完成一次单图复核；任何异常都转换成可降级的失败结果。"""
         started_s = time.monotonic()
-        messages, includes_images = self._messages(request)
-        peak_local_score = max(frame.local_fall_score for frame in request.frames)
-        peak_pose_score = max(frame.pose_score for frame in request.frames)
-        peak_data_quality = max(frame.data_quality for frame in request.frames)
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": float(self.cfg["request"]["temperature"]),
-            "max_tokens": int(self.cfg["request"]["max_tokens"]),
-        }
-        if bool(self.cfg["request"].get("force_json_response", False)):
-            payload["response_format"] = {"type": "json_object"}
-
+        observation = request.frame
+        raw_answer = ""
         try:
             if not self.ready:
-                raise RuntimeError(f"环境变量{self.api_key_env}尚未设置")
-            response = (
-                self.transport(payload)
-                if self.transport is not None
-                else self._http_post(payload)
-            )
-            model_data = self._parse_model_json(
-                self._extract_message_text(response)
-            )
-            verdict = self._normalize_verdict(model_data.get("verdict"))
-            confidence = float(
-                np.clip(float(model_data.get("confidence", 0.0)), 0.0, 1.0)
-            )
-            observations = model_data.get("observations") or []
-            if not isinstance(observations, list):
-                observations = [str(observations)]
+                raise RuntimeError(
+                    f"未找到API Key，请设置{self.api_key_env}或ai.api_key"
+                )
+            payload = self.build_payload(request)
+            response = self._request_api(payload)
+            raw_answer = self._extract_answer_text(response)
+            verdict, confidence, reason, observations = self._parse_answer(raw_answer)
             completed_s = time.monotonic()
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -474,17 +383,18 @@ class ArkChatClient:
                 success=True,
                 verdict=verdict,
                 confidence=confidence,
-                risk_level=str(model_data.get("risk_level", "unknown")),
-                reason=str(model_data.get("reason", "")),
-                observations=tuple(str(item) for item in observations[:5]),
+                risk_level="high" if verdict == AI_FALL else "low",
+                reason=reason,
+                observations=observations,
                 requested_s=request.created_s,
                 completed_s=completed_s,
                 latency_s=max(0.0, completed_s - started_s),
                 model=self.model,
-                includes_images=includes_images,
-                peak_local_score=float(peak_local_score),
-                peak_pose_score=float(peak_pose_score),
-                peak_data_quality=float(peak_data_quality),
+                includes_images=True,
+                peak_local_score=float(observation.local_fall_score),
+                peak_pose_score=float(observation.pose_score),
+                peak_data_quality=float(observation.data_quality),
+                raw_answer=raw_answer,
             )
         except Exception as error:
             completed_s = time.monotonic()
@@ -495,30 +405,35 @@ class ArkChatClient:
                 verdict=AI_UNCERTAIN,
                 confidence=0.0,
                 risk_level="unknown",
-                reason="AI复核失败，本地检测继续运行",
+                reason="AI调用失败，系统继续使用本地跌倒判断",
                 observations=(),
                 requested_s=request.created_s,
                 completed_s=completed_s,
                 latency_s=max(0.0, completed_s - started_s),
                 model=self.model,
-                includes_images=includes_images,
-                peak_local_score=float(peak_local_score),
-                peak_pose_score=float(peak_pose_score),
-                peak_data_quality=float(peak_data_quality),
+                includes_images=bool(observation.image_jpeg or request.image_url),
+                peak_local_score=float(observation.local_fall_score),
+                peak_pose_score=float(observation.pose_score),
+                peak_data_quality=float(observation.data_quality),
+                raw_answer=raw_answer,
                 error=f"{type(error).__name__}: {error}",
             )
 
 
+# 旧代码如果导入ArkChatClient仍可继续运行，实际实现已经切换到Responses API。
+ArkChatClient = ArkResponsesClient
+
+
 class AsyncAIVerifier:
-    """用固定大小线程池执行AI请求，防止网络等待卡住相机取帧。"""
+    """用后台线程执行网络请求，确保相机主循环不会等待AI。"""
 
     def __init__(
         self,
         config: dict,
-        client: Optional[ArkChatClient] = None,
+        client: Optional[ArkResponsesClient] = None,
     ):
         self.cfg = config["ai"]
-        self.client = client or ArkChatClient(config)
+        self.client = client or ArkResponsesClient(config)
         self.max_pending = int(self.cfg["request"]["max_pending_requests"])
         self.executor = ThreadPoolExecutor(
             max_workers=int(self.cfg["request"]["max_workers"]),
@@ -527,7 +442,7 @@ class AsyncAIVerifier:
         self.futures: Dict[Future, AIVerificationRequest] = {}
 
     def submit(self, request: AIVerificationRequest) -> bool:
-        """队列有空间时提交请求；队列满时返回False而不是阻塞。"""
+        """队列有空间时提交；队列满时跳过，不阻塞主循环。"""
         if len(self.futures) >= self.max_pending:
             return False
         future = self.executor.submit(self.client.verify, request)
@@ -535,7 +450,7 @@ class AsyncAIVerifier:
         return True
 
     def poll(self) -> List[AIVerificationResult]:
-        """无阻塞收集已完成请求；未完成请求留到下一帧继续检查。"""
+        """无阻塞收集已经完成的结果。"""
         completed: List[AIVerificationResult] = []
         for future, request in list(self.futures.items()):
             if not future.done():
@@ -545,6 +460,7 @@ class AsyncAIVerifier:
                 completed.append(future.result())
             except Exception as error:
                 now = time.monotonic()
+                frame = request.frame
                 completed.append(
                     AIVerificationResult(
                         event_id=request.event_id,
@@ -553,46 +469,36 @@ class AsyncAIVerifier:
                         verdict=AI_UNCERTAIN,
                         confidence=0.0,
                         risk_level="unknown",
-                        reason="AI后台任务异常，本地检测继续运行",
+                        reason="AI后台任务异常，系统继续使用本地判断",
                         observations=(),
                         requested_s=request.created_s,
                         completed_s=now,
                         latency_s=max(0.0, now - request.created_s),
                         model=self.client.model,
-                        includes_images=False,
-                        peak_local_score=max(
-                            frame.local_fall_score
-                            for frame in request.frames
-                        ),
-                        peak_pose_score=max(
-                            frame.pose_score
-                            for frame in request.frames
-                        ),
-                        peak_data_quality=max(
-                            frame.data_quality
-                            for frame in request.frames
-                        ),
+                        includes_images=bool(frame.image_jpeg),
+                        peak_local_score=float(frame.local_fall_score),
+                        peak_pose_score=float(frame.pose_score),
+                        peak_data_quality=float(frame.data_quality),
                         error=f"{type(error).__name__}: {error}",
                     )
                 )
         return completed
 
     def close(self) -> None:
-        """停止接收新任务；正在执行的网络请求受timeout_s限制。"""
+        """停止接收新请求；正在执行的请求仍受timeout_s限制。"""
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 class AIFallCoordinator:
-    """管理事件触发、冷却、网络退避、最新结果和每人请求状态。"""
+    """管理0.50触发、单图提交、冷却、断网退避和最新AI结果。"""
 
     def __init__(
         self,
         config: dict,
-        client: Optional[ArkChatClient] = None,
+        client: Optional[ArkResponsesClient] = None,
     ):
         self.cfg = config["ai"]
         self.enabled = bool(self.cfg["enabled"])
-        self.buffer = AIEventBuffer(config)
         self.verifier = AsyncAIVerifier(config, client=client)
         self.pending_people: Dict[int, str] = {}
         self.latest_results: Dict[int, AIVerificationResult] = {}
@@ -606,32 +512,20 @@ class AIFallCoordinator:
     def supports_vision(self) -> bool:
         return bool(self.verifier.client.supports_vision)
 
-    def should_capture_image(self, person_id: int, timestamp_s: float) -> bool:
-        """文本模型返回False；视觉模式按缓冲采样间隔返回True。"""
-        return bool(
-            self.enabled
-            and self.supports_vision
-            and self.buffer.should_capture_image(person_id, timestamp_s)
-        )
-
     def _risk_triggered(self, observation: AIFrameObservation) -> bool:
-        """本地FALL立即触发；疑似风险需要同时满足总分、P和质量门槛。"""
-        trigger_cfg = self.cfg["trigger"]
-        if observation.local_label == "FALL":
-            return True
+        """本地FallScore达到阈值就认为值得上传，不再强制其他维度。"""
         return bool(
-            observation.local_fall_score >= float(trigger_cfg["fall_score"])
-            and observation.pose_score >= float(trigger_cfg["min_pose_score"])
-            and observation.data_quality >= float(trigger_cfg["min_data_quality"])
+            observation.local_fall_score
+            >= float(self.cfg["trigger"]["fall_score"])
         )
 
-    def observe(self, observation: AIFrameObservation) -> bool:
-        """保存本帧并按条件异步提交AI；返回True表示成功创建请求。"""
-        self.buffer.add(observation)
+    def _request_allowed(self, observation: AIFrameObservation) -> bool:
+        """检查密钥、视觉能力、连续帧、冷却、队列和网络退避。"""
         person_id = int(observation.person_id)
         now = float(observation.timestamp_s)
-
         if not self.enabled or not self.verifier.client.ready:
+            return False
+        if not self.supports_vision:
             return False
 
         if self._risk_triggered(observation):
@@ -641,7 +535,7 @@ class AIFallCoordinator:
             return False
 
         required_frames = int(self.cfg["trigger"]["consecutive_frames"])
-        if observation.local_label != "FALL" and self.consecutive_risk[person_id] < required_frames:
+        if self.consecutive_risk[person_id] < required_frames:
             return False
         if person_id in self.pending_people or now < self.backoff_until_s:
             return False
@@ -653,25 +547,44 @@ class AIFallCoordinator:
         )
         cooldown_s = float(self.cfg["trigger"][cooldown_key])
         last_submit = self.last_submit_s.get(person_id)
-        if last_submit is not None and now - last_submit < cooldown_s:
+        return bool(last_submit is None or now - last_submit >= cooldown_s)
+
+    def observe(
+        self,
+        observation: AIFrameObservation,
+        image_provider: Optional[Callable[[], Optional[bytes]]] = None,
+    ) -> bool:
+        """风险达到0.50时获取当前单帧并异步提交；返回是否提交成功。"""
+        if not self._request_allowed(observation):
             return False
 
-        verification_request = self.buffer.build_request(person_id, now)
-        if verification_request is None or not self.verifier.submit(verification_request):
+        if not observation.image_jpeg and image_provider is not None:
+            observation.image_jpeg = image_provider()
+        if not observation.image_jpeg:
             return False
 
-        self.pending_people[person_id] = verification_request.event_id
+        person_id = int(observation.person_id)
+        now = float(observation.timestamp_s)
+        event_id = f"person-{person_id}-{int(now * 1000)}"
+        verification_request = AIVerificationRequest(
+            event_id=event_id,
+            person_id=person_id,
+            created_s=now,
+            frame=observation,
+        )
+        if not self.verifier.submit(verification_request):
+            return False
+
+        self.pending_people[person_id] = event_id
         self.last_submit_s[person_id] = now
         self.consecutive_risk[person_id] = 0
         return True
 
     def poll(self, now_s: Optional[float] = None) -> List[AIVerificationResult]:
-        """收集后台结果，并根据成功或失败更新网络退避状态。"""
+        """收集AI结果；失败后指数退避，期间直接跳过新AI请求。"""
         now = time.monotonic() if now_s is None else float(now_s)
-        results = self.verifier.poll()
         accepted_results: List[AIVerificationResult] = []
-        for result in results:
-            # 人员离场后旧网络任务可能才返回，不能让旧结果污染复用的Track ID。
+        for result in self.verifier.poll():
             if result.event_id in self.ignored_event_ids:
                 self.ignored_event_ids.discard(result.event_id)
                 continue
@@ -679,6 +592,7 @@ class AIFallCoordinator:
                 self.pending_people.pop(result.person_id, None)
             self.latest_results[result.person_id] = result
             accepted_results.append(result)
+
             if result.success:
                 self.failure_count = 0
                 self.backoff_until_s = 0.0
@@ -698,50 +612,69 @@ class AIFallCoordinator:
         person_id: int,
         now_s: float,
     ) -> Optional[AIVerificationResult]:
-        """只返回仍在有效期内且成功的结果，过期结果不参与融合。"""
+        """只返回有效期内、成功且结论明确的AI结果。"""
         result = self.latest_results.get(int(person_id))
         if result is None or not result.usable:
             return None
-        result_ttl_s = float(self.cfg["trigger"]["result_ttl_s"])
-        if float(now_s) - result.completed_s > result_ttl_s:
+        ttl_s = float(self.cfg["trigger"]["result_ttl_s"])
+        if float(now_s) - result.completed_s > ttl_s:
             return None
         return result
 
     def status(self, person_id: int, now_s: float) -> AIPersonStatus:
-        """生成面向画面的状态，不暴露API密钥或完整响应。"""
+        """生成画面状态，不显示API Key或完整请求内容。"""
         person_id = int(person_id)
         now = float(now_s)
         if not self.enabled:
             return AIPersonStatus("DISABLED", None, False, "配置已关闭")
+        if not self.supports_vision:
+            return AIPersonStatus(
+                "NO_VISION",
+                None,
+                False,
+                "ai.supports_vision必须为true",
+            )
         if not self.verifier.client.ready:
             return AIPersonStatus(
                 "NO_KEY",
                 None,
                 False,
-                f"请设置{self.verifier.client.api_key_env}",
+                f"请设置{self.verifier.client.api_key_env}或ai.api_key",
             )
         if person_id in self.pending_people:
-            return AIPersonStatus("PENDING", None, True, "后台复核中")
+            return AIPersonStatus("PENDING", None, True, "单图后台复核中")
         result = self.latest_results.get(person_id)
-        if result is not None and not result.success:
-            return AIPersonStatus("ERROR", result, False, result.error)
-        usable = self.latest_result(person_id, now)
-        if usable is not None:
-            return AIPersonStatus(usable.verdict, usable, False, usable.reason)
         if now < self.backoff_until_s:
             remaining = max(0.0, self.backoff_until_s - now)
             return AIPersonStatus(
                 "BACKOFF",
-                None,
+                result,
                 False,
-                f"网络退避{remaining:.1f}s",
+                f"网络失败，{remaining:.1f}秒内跳过AI",
             )
-        return AIPersonStatus("IDLE", None, False, "等待本地疑似事件")
+        if result is not None and not result.success:
+            return AIPersonStatus("ERROR", result, False, result.error)
+        if (
+            result is not None
+            and result.success
+            and result.verdict == AI_UNCERTAIN
+            and now - result.completed_s
+            <= float(self.cfg["trigger"]["result_ttl_s"])
+        ):
+            return AIPersonStatus(
+                AI_UNCERTAIN,
+                result,
+                False,
+                result.reason,
+            )
+        usable = self.latest_result(person_id, now)
+        if usable is not None:
+            return AIPersonStatus(usable.verdict, usable, False, usable.reason)
+        return AIPersonStatus("IDLE", None, False, "等待本地分数达到触发值")
 
     def reset_person(self, person_id: int) -> None:
-        """人员离场时清除缓冲和AI状态；已提交网络任务不能强制中断。"""
+        """人员离场时清除AI状态，迟到的旧结果不会污染复用ID。"""
         person_id = int(person_id)
-        self.buffer.reset_person(person_id)
         pending_event = self.pending_people.pop(person_id, None)
         if pending_event is not None:
             self.ignored_event_ids.add(pending_event)
@@ -750,61 +683,62 @@ class AIFallCoordinator:
         self.last_submit_s.pop(person_id, None)
 
     def close(self) -> None:
-        """释放后台线程池。"""
+        """关闭后台线程池。"""
         self.verifier.close()
 
 
-def run_self_test(config: dict) -> None:
-    """使用假API验证缓冲、异步请求、JSON解析和文本模式。"""
-    def fake_transport(payload: dict) -> dict:
-        assert payload["model"] == config["ai"]["model"]
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "verdict": "fall",
-                                "confidence": 0.91,
-                                "risk_level": "high",
-                                "reason": "姿态、高度和静止证据连续异常",
-                                "observations": ["P较高", "H较高"],
-                            },
-                            ensure_ascii=False,
-                        )
-                    }
-                }
-            ]
-        }
-
-    test_config = json.loads(json.dumps(config))
-    test_config["ai"]["enabled"] = True
-    test_config["ai"]["supports_vision"] = False
-    test_config["ai"]["trigger"]["consecutive_frames"] = 1
-    client = ArkChatClient(test_config, transport=fake_transport)
-    coordinator = AIFallCoordinator(test_config, client=client)
-    observation = AIFrameObservation(
+def _test_observation(image_jpeg: bytes = b"fake-jpeg") -> AIFrameObservation:
+    """构造离线测试使用的单帧高风险观测。"""
+    return AIFrameObservation(
         person_id=1,
         timestamp_s=10.0,
         local_label="NO_FALL",
-        local_fall_score=0.72,
-        pose_score=0.90,
-        height_score=0.80,
+        local_fall_score=0.50,
+        pose_score=0.85,
+        height_score=0.70,
         velocity_score=0.60,
-        static_score=0.70,
+        static_score=0.40,
         scene_score=1.00,
         valid_dimensions=("P", "H", "V", "S", "C"),
         degraded_mode=False,
-        data_quality=0.95,
-        angle_2d_deg=8.0,
-        angle_3d_deg=80.0,
-        hip_height_m=0.18,
-        vertical_velocity_mps=-0.90,
-        static_duration_s=2.0,
+        data_quality=0.90,
+        angle_2d_deg=10.0,
+        angle_3d_deg=78.0,
+        hip_height_m=0.20,
+        vertical_velocity_mps=-0.80,
+        static_duration_s=1.2,
         scene_relation="lying_on_floor",
-        scene_confidence=0.90,
+        scene_confidence=0.85,
+        image_jpeg=image_jpeg,
     )
-    assert coordinator.observe(observation)
+
+
+def run_self_test(config: dict) -> None:
+    """验证Responses格式、0.50触发、单图、异步结果和断网降级。"""
+    test_config = json.loads(json.dumps(config))
+    test_config["ai"]["enabled"] = True
+    test_config["ai"]["supports_vision"] = True
+    test_config["ai"]["trigger"]["fall_score"] = 0.50
+    test_config["ai"]["trigger"]["consecutive_frames"] = 1
+
+    def fake_transport(payload: dict) -> dict:
+        content = payload["input"][0]["content"]
+        image_items = [item for item in content if item["type"] == "input_image"]
+        assert len(image_items) == 1
+        assert image_items[0]["image_url"].startswith("data:image/jpeg;base64,")
+        return {"output_text": "true"}
+
+    client = ArkResponsesClient(test_config, transport=fake_transport)
+    coordinator = AIFallCoordinator(test_config, client=client)
+    observation = _test_observation(image_jpeg=b"")
+    image_provider_calls = []
+
+    def image_provider() -> bytes:
+        image_provider_calls.append(1)
+        return b"one-jpeg-only"
+
+    assert coordinator.observe(observation, image_provider=image_provider)
+    assert len(image_provider_calls) == 1
 
     results: List[AIVerificationResult] = []
     for _ in range(100):
@@ -813,84 +747,131 @@ def run_self_test(config: dict) -> None:
             break
         time.sleep(0.01)
     assert len(results) == 1
-    assert results[0].success and results[0].verdict == AI_FALL
-    assert results[0].confidence > 0.90
-    assert not results[0].includes_images
-    assert coordinator.latest_result(1, results[0].completed_s) is not None
+    assert results[0].usable and results[0].verdict == AI_FALL
+    assert results[0].includes_images
+
+    # 低于0.50不能编码图片，也不能提交API。
+    low_risk = _test_observation(image_jpeg=b"")
+    low_risk.person_id = 2
+    low_risk.local_fall_score = 0.49
+    assert not coordinator.observe(low_risk, image_provider=image_provider)
+    assert len(image_provider_calls) == 1
     coordinator.close()
 
-    # 验证未来视觉模型会使用同一接口附加Base64 JPEG。
-    vision_config = json.loads(json.dumps(test_config))
-    vision_config["ai"]["supports_vision"] = True
-    vision_client = ArkChatClient(vision_config, transport=fake_transport)
-    observation.image_jpeg = b"fake-jpeg-bytes"
-    vision_request = AIVerificationRequest(
-        event_id="vision-interface-test",
-        person_id=1,
-        created_s=10.0,
-        frames=(observation,),
-    )
-    messages, includes_images = vision_client._messages(vision_request)
-    assert includes_images
-    assert messages[1]["content"][1]["type"] == "image_url"
-
-    # 模型没有返回JSON时必须形成失败结果，不能抛出异常中断主循环。
-    bad_client = ArkChatClient(
+    # 模拟断网：失败结果必须被收集，不能向主循环抛异常。
+    offline_client = ArkResponsesClient(
         test_config,
-        transport=lambda payload: {
-            "choices": [{"message": {"content": "无法判断"}}]
-        },
+        transport=lambda payload: (_ for _ in ()).throw(
+            RuntimeError("NETWORK_ERROR")
+        ),
     )
-    bad_result = bad_client.verify(vision_request)
-    assert not bad_result.success and bad_result.verdict == AI_UNCERTAIN
+    offline_result = offline_client.verify(
+        AIVerificationRequest(
+            event_id="offline-test",
+            person_id=1,
+            created_s=10.0,
+            frame=_test_observation(),
+        )
+    )
+    assert not offline_result.success
+    assert offline_result.verdict == AI_UNCERTAIN
     print("ai_verifier self-test: PASS")
-    print(
-        "  event buffer, async request, JSON parsing, "
-        "vision interface, failure fallback=PASS"
-    )
+    print("  Responses API, 0.50 trigger, one image, async and offline fallback=PASS")
 
 
-def run_api_test(config: dict) -> None:
-    """使用环境变量中的真实密钥发送一次最小请求，便于先验证API。"""
-    client = ArkChatClient(config)
-    if not client.ready:
-        raise RuntimeError(
-            f"请先设置环境变量{client.api_key_env}，再运行--api-test"
+def _load_image_input(image_input: str, config: dict,) -> Tuple[bytes, str, str]:
+    """读取测试图片；本地图片会缩小并压缩成JPEG，URL保持不变。"""
+
+    # 网络图片和已经编码好的Data URL不需要本地处理。
+    if image_input.startswith(("http://", "https://", "data:image/")):
+        return b"", image_input, "image/jpeg"
+
+    image_path = Path(image_input).expanduser().resolve()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"测试图片不存在：{image_path}")
+
+    # 放在函数内导入，不影响不使用真实图片的离线测试。
+    import cv2
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(
+            "OpenCV无法读取图片，请使用jpg、jpeg、png或webp格式"
         )
 
-    now = time.monotonic()
-    observation = AIFrameObservation(
-        person_id=999,
-        timestamp_s=now,
-        local_label="NO_FALL",
-        local_fall_score=0.68,
-        pose_score=0.85,
-        height_score=0.75,
-        velocity_score=0.60,
-        static_score=0.50,
-        scene_score=1.00,
-        valid_dimensions=("P", "H", "V", "S", "C"),
-        degraded_mode=False,
-        data_quality=0.90,
-        angle_2d_deg=12.0,
-        angle_3d_deg=76.0,
-        hip_height_m=0.20,
-        vertical_velocity_mps=-0.75,
-        static_duration_s=1.5,
-        scene_relation="lying_on_floor",
-        scene_confidence=0.85,
+    image_config = config["ai"]["image"]
+    max_long_side = int(image_config["max_long_side_px"])
+    jpeg_quality = int(image_config["jpeg_quality"])
+
+    if max_long_side <= 0:
+        raise ValueError("ai.image.max_long_side_px必须大于0")
+
+    if not 1 <= jpeg_quality <= 100:
+        raise ValueError("ai.image.jpeg_quality必须在1到100之间")
+
+    # 图片最长边超过限制时等比例缩小，小图片不放大。
+    image_height, image_width = image.shape[:2]
+    current_long_side = max(image_height, image_width)
+
+    if current_long_side > max_long_side:
+        scale = max_long_side / float(current_long_side)
+        output_width = max(1, int(round(image_width * scale)))
+        output_height = max(1, int(round(image_height * scale)))
+
+        image = cv2.resize(
+            image,
+            (output_width, output_height),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    # 无论原图是PNG还是JPG，都统一压缩为较小的JPEG。
+    success, encoded_image = cv2.imencode(
+        ".jpg",
+        image,
+        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
     )
-    verification_request = AIVerificationRequest(
-        event_id="manual-api-test",
+    if not success:
+        raise RuntimeError("测试图片JPEG编码失败")
+
+    image_bytes = encoded_image.tobytes()
+
+    print(
+        f"图片处理完成：{image.shape[1]}×{image.shape[0]}，"
+        f"JPEG大小约{len(image_bytes) / 1024:.1f}KB"
+    )
+
+    return image_bytes, "", "image/jpeg" 
+
+
+def run_api_test(config: dict, image_input: str) -> None:
+    """上传用户指定的一张真实图片，验证模型能否返回true或false。"""
+    client = ArkResponsesClient(config)
+    if not client.ready:
+        raise RuntimeError(
+            f"请先设置{client.api_key_env}或config.yaml中的ai.api_key"
+        )
+    image_bytes, image_url, mime_type = _load_image_input(
+    image_input,
+    config,
+    )
+    observation = _test_observation(image_jpeg=image_bytes)
+    now = time.monotonic()
+    observation.person_id = 999
+    observation.timestamp_s = now
+    request = AIVerificationRequest(
+        event_id="manual-single-image-test",
         person_id=999,
         created_s=now,
-        frames=(observation,),
+        frame=observation,
+        image_url=image_url,
+        image_mime_type=mime_type,
     )
-    result = client.verify(verification_request)
+    result = client.verify(request)
     print(
         f"API test: success={result.success} "
         f"verdict={result.verdict} confidence={result.confidence:.2f}"
     )
+    print(f"answer={result.raw_answer or '<empty>'}")
     print(f"reason={result.reason}")
     if not result.success:
         raise RuntimeError(result.error)
@@ -903,8 +884,8 @@ def load_config(path: str) -> dict:
 
 
 def main() -> None:
-    """支持离线自测、真实API测试和相机AI复核三种入口。"""
-    parser = argparse.ArgumentParser(description="豆包AI跌倒复核模块")
+    """支持离线自测、真实单图API测试和相机AI模式。"""
+    parser = argparse.ArgumentParser(description="豆包视觉模型单图跌倒复核")
     parser.add_argument(
         "--config",
         default=str(Path(__file__).resolve().parent / "config.yaml"),
@@ -917,15 +898,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--api-test",
-        action="store_true",
-        help="使用环境变量密钥发送一次真实豆包请求",
+        metavar="IMAGE",
+        help="上传一张本地图片、图片URL或Data URL进行真实API测试",
     )
     args = parser.parse_args()
     config = load_config(args.config)
     if args.self_test:
         run_self_test(config)
     elif args.api_test:
-        run_api_test(config)
+        run_api_test(config, args.api_test)
     else:
         from main import run_live
 

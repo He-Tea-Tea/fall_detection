@@ -45,9 +45,45 @@ flowchart TD
 5. 六个特征文件分别计算`P3D、P2D、H、V、S、C`。
 6. `P3D`和`P2D`融合为五维中的姿态分`P`。
 7. `fall_detector.py`加权`P/H/V/S/C`，只输出`FALL`或`NO_FALL`。
-8. 本地结果达到疑似阈值时，`ai_verifier.py`异步提交短时序列给豆包。
-9. `decision_fusion.py`组合本地状态和有效期内的AI结果。
+8. 本地`FallScore`达到0.50时，`ai_verifier.py`异步上传当前一张RGB图片。
+9. `decision_fusion.py`优先采用明确AI回答，AI不可用时使用本地结果。
 10. 最终状态变化由`alert_manager.py`转换成可扩展的告警事件。
+### 完整流程图
+
+![alt text](mermaid-diagram.png)
+
+### 关键条件汇总
+
+| 阶段              | 判断条件                      | 处理结果             |
+| --------------- | ------------------------- | ---------------- |
+| 本地触发AI          | `FallScore >= 0.50`       | 准备上传当前图片         |
+| 不触发AI           | `FallScore < 0.50`        | 不编码、不上传          |
+| 图片数量            | 每次1张                      | 当前完整RGB画面        |
+| 图片尺寸            | 原始画面`640×400`             | 不放大、不缩小          |
+| 图片压缩            | `jpeg_quality: 75`        | 减少上传大小           |
+| AI并发            | `max_pending_requests: 1` | 前一个请求未结束时不再提交    |
+| 普通疑似复查          | 距离上次请求至少5秒                | 可以再次上传           |
+| 本地FALL复查        | 距离上次请求至少10秒               | 可以再次上传           |
+| AI超时            | 默认10秒                     | 放弃本次AI，使用本地结果    |
+| 第一次网络退避         | 3秒                        | 暂停提交新AI请求        |
+| 连续网络失败          | 3、6、12、24、48、60秒          | 最长退避60秒          |
+| AI回答`true`      | 明确有效                      | 最终输出FALL，保持15秒   |
+| AI回答`false`     | 明确有效                      | 最终输出NO_FALL，保持3秒 |
+| AI回答`uncertain` | 证据不足                      | 使用本地结果           |
+| AI调用失败          | 断网、超时、模型错误                | 使用本地结果           |
+| 人员离场            | 超过`stale_person_s`，默认5秒   | 清除该ID全部历史        |
+
+最终优先级是：
+
+```text
+后续语音/人工确认
+        ↓
+有效的视觉AI回答
+        ↓
+本地P/H/V/S/C状态机
+```
+
+
 
 ## 3. 每个文件到底负责什么
 
@@ -61,8 +97,8 @@ flowchart TD
 | `static.py` | Track ID、时间、躯干3D中心、`P/H` | 异常后的静止时间 | `StaticScoreResult`和`S` |
 | `scene.py` | 人体几何、3D角度、家具Mask和Depth | 人与家具/地面的关系 | `SceneRelationResult`和`C` |
 | `fall_detector.py` | `P/H/V/S/C`和恢复所需测量 | 总分、确认和恢复 | `FallDecision` |
-| `ai_verifier.py` | 本地时间序列、可选多帧JPEG | 事件缓冲、后台API请求、JSON解析和网络退避 | `AIVerificationResult` |
-| `decision_fusion.py` | 本地结果和AI复核结果 | 本地优先、AI辅助确认和结果保持 | `FusionDecision` |
+| `ai_verifier.py` | 本地触发分数和当前一张JPEG | Responses API、后台请求、回答解析和断网退避 | `AIVerificationResult` |
+| `decision_fusion.py` | 本地、视觉AI及预留外部确认 | AI优先、断网本地降级和正负结果保持 | `FusionDecision` |
 | `alert_manager.py` | 最终融合结果 | 检测状态变化并调用告警处理器 | `AlertEvent` |
 | `main.py` | 配置、相机和模型 | 组织完整调用顺序和显示 | 实时窗口 |
 | `config.yaml` | 人工设置 | 集中保存所有可调参数 | 配置字典 |
@@ -395,8 +431,8 @@ FallScore = 0.30P + 0.25H + 0.20V + 0.15S + 0.10C
 | `C / relation / conf` | 场景分、人物场景关系、关系置信度 |
 | `FallScore` | 五维最终加权分 |
 | `FALL / NO_FALL` | 二值状态机输出 |
-| `AI / conf / input` | AI状态、置信度和DATA或VISION输入模式 |
-| `FINAL / source` | 融合后的最终状态及LOCAL、LOCAL+AI或AI_ASSISTED来源 |
+| `AI / conf / input` | AI状态、内部置信度和ONE_IMAGE单图输入模式 |
+| `FINAL / source` | 最终状态及AI_PRIMARY或LOCAL_FALLBACK来源 |
 
 ## 13. 单独测试和完整运行
 
@@ -464,20 +500,18 @@ python main.py --stage full
 
 只要相机安装姿态和内参没有变化，就不需要每次启动程序都重新标定。
 
-## 15. 当前豆包AI判断逻辑
+## 15. 当前豆包视觉AI判断逻辑
 
-当前配置使用`doubao-1-5-pro-32k-250115`。该模型属于文本模型，不能直接理解图片，因此当前AI收到的是最近5秒内选出的多个时间点，包括本地总分、`P/H/V/S/C`、有效维度、2D/3D角度、髋高、垂直速度、静止时间和场景关系。
+`config.yaml`中的`ai.model`必须换成账号已经开通、支持图片理解和Responses API的模型或`ep-...`接入点。本地`FallScore`低于0.50时完全不处理图片；达到0.50时只编码触发时刻这一张干净RGB画面并放入后台线程。默认保留完整场景，最长边限制为768像素，JPEG质量为75，使AI能同时看见人体、地板、床、沙发和椅子。
 
-AI不是固定每秒调用。只有本地总分、姿态分和数据质量连续达到`config.yaml`中的触发条件，或者本地已经确认`FALL`时，才创建后台请求。同一人员请求之间有冷却时间；网络失败后采用指数退避；API密钥缺失、请求超时、解析失败或AI输出`UNCERTAIN`时，本地状态机照常运行。
+模型只回答`true`、`false`或`uncertain`：
 
-最终融合遵守以下顺序：
+1. `true`：至少一人明显意外倒卧或异常坐卧在地面上。
+2. `false`：没有跌倒，或只是正常站立、弯腰、下蹲、坐椅子、躺床/沙发。
+3. `uncertain`：遮挡、模糊或单图证据不足，最终退回本地判断。
 
-1. 本地已经确认`FALL`：立即输出`FALL`，AI不能否决。
-2. 本地处于中高风险但尚未确认：高置信度AI可辅助确认`FALL`。
-3. 文本AI只使用本地数据，因此要求的本地最低总分高于视觉AI。
-4. AI返回`NO_FALL`：只能作为复核信息，不能解除本地已确认报警。
-5. AI不可用：最终结果自动等于本地结果。
+明确AI回答在短时间内优先于本地结果：`true`默认保持15秒，`false`默认保持3秒。没有密钥、模型未开通、断网、超时、接口报错、格式错误和结果过期时，最终结果自动等于本地状态机输出。网络请求在后台运行，所以本地P/H/V/S/C和相机画面不会暂停。
 
-代码已经预留视觉模式。以后换成支持图片的模型或推理接入点后，将`ai.model`改成对应名称，将`ai.supports_vision`改成`true`，系统就会按采样间隔裁剪人体及周边场景、选择多帧JPEG，并沿用同一个异步接口和融合接口。
+`decision_fusion.py`还提供`ExternalConfirmation`接口。后续语音识别可把“我没事”转换为`NO_FALL`，把“救命、起不来”转换为`FALL`，再通过同一融合层进入告警流程。
 
 API配置和运行命令见`AI_SETUP.md`。

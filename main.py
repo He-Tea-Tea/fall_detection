@@ -25,11 +25,11 @@ main.py 只负责组织整个程序，不重复各个评分模块内部的计算
 - 已确认FALL后，不会因为Depth突然丢失而自动解除报警。
 
 AI复核原则：
-- AI采用事件触发，不固定每秒上传，不阻塞相机主循环；
-- 当前豆包文本模型读取P/H/V/S/C时间序列，不直接读取图片；
-- 后续视觉模型的多帧JPEG接口已经预留，可通过配置开启；
-- API密钥缺失、断网、超时或AI不确定时，继续使用本地结果；
-- 本地状态机确认的FALL优先，AI不能将其改成NO_FALL。
+- 本地FallScore达到0.50时事件触发，不固定每秒上传；
+- 每次只上传当前一张经过缩放和JPEG压缩的RGB图片；
+- API在后台线程运行，不阻塞相机采集和本地五维判断；
+- AI成功返回true/false后短时间以AI为主；
+- API密钥缺失、断网、超时或回答无效时立即使用本地结果。
 
 所有可调参数来自config.yaml。
 ground_detector.py是独立地面标定工具，本文件只读取它生成的ground.yaml。
@@ -210,7 +210,7 @@ def load_config(path: str) -> dict:
     if not 0.0 <= mask_alpha <= 1.0:
         raise ValueError("display.scene_mask_alpha必须在0到1之间")
 
-    # API密钥只检查环境变量名称，密钥本身不能出现在config.yaml中。
+    # 推荐从环境变量读取密钥，同时兼容用户在本机config.yaml填写ai.api_key。
     ai_config = config["ai"]
     if not str(ai_config["api_key_env"]).strip():
         raise ValueError("ai.api_key_env不能为空")
@@ -220,14 +220,26 @@ def load_config(path: str) -> dict:
         raise ValueError("ai.request.max_workers必须大于0")
     if int(ai_config["request"]["max_pending_requests"]) <= 0:
         raise ValueError("ai.request.max_pending_requests必须大于0")
+    if not bool(ai_config["supports_vision"]):
+        raise ValueError("当前AI流程需要上传图片，ai.supports_vision必须为true")
+    if int(ai_config["request"]["max_output_tokens"]) <= 0:
+        raise ValueError("ai.request.max_output_tokens必须大于0")
+    if not str(ai_config.get("prompt", {}).get("text", "")).strip():
+        raise ValueError("ai.prompt.text不能为空")
+
+    image_config = ai_config["image"]
+    if image_config["mode"] not in {"full_frame", "person_context"}:
+        raise ValueError("ai.image.mode只能是full_frame或person_context")
+    if int(image_config["max_long_side_px"]) <= 0:
+        raise ValueError("ai.image.max_long_side_px必须大于0")
+    if not 1 <= int(image_config["jpeg_quality"]) <= 100:
+        raise ValueError("ai.image.jpeg_quality必须在1到100之间")
 
     score_keys = (
         ("ai.trigger.fall_score", ai_config["trigger"]["fall_score"]),
-        ("ai.trigger.min_pose_score", ai_config["trigger"]["min_pose_score"]),
-        ("ai.trigger.min_data_quality", ai_config["trigger"]["min_data_quality"]),
         (
-            "ai.fusion.min_ai_fall_confidence",
-            ai_config["fusion"]["min_ai_fall_confidence"],
+            "ai.fusion.min_ai_confidence",
+            ai_config["fusion"]["min_ai_confidence"],
         ),
     )
     for name, value in score_keys:
@@ -916,39 +928,54 @@ def build_fall_evidence(
 # 本地结果转换为AI复核输入
 # ----------------------------------------------------------------------
 
-def encode_person_crop(
+def encode_ai_image(
     image: np.ndarray,
     bbox: Sequence[float],
     ai_config: dict,
 ) -> Optional[bytes]:
-    """裁剪人体及周边场景并编码为JPEG，供后续视觉模型使用。
+    """把当前RGB画面整理成一次AI请求使用的单张JPEG。
 
-    当前文本模型supports_vision=false时，main.py不会调用本函数，因此不会
-    产生额外JPEG编码开销。切换视觉模型后，事件缓冲区只按配置间隔调用。
+    full_frame保留床、沙发和地面等完整场景，适合当前640×400画面；
+    person_context只保留人体框及周边区域，适合高分辨率画面节省带宽。
+    两种模式都会限制最长边且绝不放大原图，最后再执行JPEG压缩。
     """
     import cv2
 
     if image is None or image.ndim != 3:
         return None
 
-    image_height, image_width = image.shape[:2]
-    x1, y1, x2, y2 = map(float, bbox)
-    box_width = max(1.0, x2 - x1)
-    box_height = max(1.0, y2 - y1)
-    margin = float(ai_config["buffer"]["crop_margin_ratio"])
+    image_config = ai_config["image"]
+    output_image = image
+    if image_config["mode"] == "person_context":
+        image_height, image_width = image.shape[:2]
+        x1, y1, x2, y2 = map(float, bbox)
+        box_width = max(1.0, x2 - x1)
+        box_height = max(1.0, y2 - y1)
+        margin = float(image_config["crop_margin_ratio"])
+        crop_x1 = max(0, int(np.floor(x1 - box_width * margin)))
+        crop_y1 = max(0, int(np.floor(y1 - box_height * margin)))
+        crop_x2 = min(image_width, int(np.ceil(x2 + box_width * margin)))
+        crop_y2 = min(image_height, int(np.ceil(y2 + box_height * margin)))
+        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            return None
+        output_image = image[crop_y1:crop_y2, crop_x1:crop_x2]
 
-    crop_x1 = max(0, int(np.floor(x1 - box_width * margin)))
-    crop_y1 = max(0, int(np.floor(y1 - box_height * margin)))
-    crop_x2 = min(image_width, int(np.ceil(x2 + box_width * margin)))
-    crop_y2 = min(image_height, int(np.ceil(y2 + box_height * margin)))
-    if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
-        return None
+    max_long_side = int(image_config["max_long_side_px"])
+    current_long_side = max(output_image.shape[:2])
+    if current_long_side > max_long_side:
+        scale = max_long_side / float(current_long_side)
+        output_width = max(1, int(round(output_image.shape[1] * scale)))
+        output_height = max(1, int(round(output_image.shape[0] * scale)))
+        output_image = cv2.resize(
+            output_image,
+            (output_width, output_height),
+            interpolation=cv2.INTER_AREA,
+        )
 
-    crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
-    jpeg_quality = int(ai_config["buffer"]["jpeg_quality"])
+    jpeg_quality = int(image_config["jpeg_quality"])
     success, encoded = cv2.imencode(
         ".jpg",
-        crop,
+        output_image,
         [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
     )
     return encoded.tobytes() if success else None
@@ -965,7 +992,7 @@ def build_ai_observation(
     scene_result: Optional[SceneRelationResult],
     image_jpeg: Optional[bytes] = None,
 ) -> AIFrameObservation:
-    """把画面测量和本地状态机结果整理成AI可理解的一条时间序列数据。"""
+    """整理触发时刻的本地数据；真正提交时只附加当前一张JPEG。"""
     angle_2d = (
         pose_2d_result.image_angle_deg
         if pose_2d_result is not None and pose_2d_result.valid_angle
@@ -1499,11 +1526,7 @@ def draw_person(
             if ai_status.result is not None and ai_status.result.success
             else "N/A"
         )
-        ai_input_mode = (
-            "VISION"
-            if ai_status.result is not None and ai_status.result.includes_images
-            else "DATA"
-        )
+        ai_input_mode = "ONE_IMAGE"
         values.append(
             f"AI={ai_status.state} "
             f"conf={ai_confidence_text} "
@@ -1766,8 +1789,8 @@ def run_live(
     ):
         key_name = ai_coordinator.verifier.client.api_key_env
         print(
-            f"警告：没有找到环境变量{key_name}，"
-            "当前自动使用本地判断，设置密钥后AI会自动启用"
+            f"警告：没有找到{key_name}或ai.api_key，"
+            "当前跳过AI并直接使用本地判断"
         )
 
     def reset_person(person_id: int) -> None:
@@ -2127,16 +2150,9 @@ def run_live(
                         ai_status = None
                         fusion_decision = None
                         if decision is not None and ai_coordinator is not None:
-                            # 当前文本模型不编码图片；以后开启视觉模型后，
-                            # 仅在缓冲采样时裁剪人体及周边场景。
-                            image_jpeg = None
-                            if ai_coordinator.should_capture_image(person_id, now):
-                                image_jpeg = encode_person_crop(
-                                    inference_image,
-                                    measurement.bbox,
-                                    config["ai"],
-                                )
-
+                            # 先构造不含图片的轻量观测。只有本地FallScore达到
+                            # 0.50且冷却、网络、队列均允许时，协调器才调用
+                            # image_provider编码这一张图片，正常帧不会浪费CPU。
                             ai_observation = build_ai_observation(
                                 measurement,
                                 now,
@@ -2146,9 +2162,16 @@ def run_live(
                                 velocity_result,
                                 static_result,
                                 scene_result,
-                                image_jpeg,
+                                image_jpeg=None,
                             )
-                            ai_coordinator.observe(ai_observation)
+                            ai_coordinator.observe(
+                                ai_observation,
+                                image_provider=lambda: encode_ai_image(
+                                    inference_image,
+                                    measurement.bbox,
+                                    config["ai"],
+                                ),
+                            )
                             ai_result = ai_coordinator.latest_result(
                                 person_id,
                                 now,
@@ -2304,6 +2327,28 @@ def run_self_test(config: dict) -> None:
     assert resized_mask.dtype == np.bool_
     assert np.any(resized_mask)
 
+    # 有OpenCV时额外验证高分辨率AI图片会被限制到配置最长边。
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None
+    if cv2 is not None:
+        large_image = np.zeros((900, 1200, 3), dtype=np.uint8)
+        ai_jpeg = encode_ai_image(
+            large_image,
+            [200.0, 100.0, 800.0, 850.0],
+            config["ai"],
+        )
+        assert ai_jpeg is not None
+        decoded_ai_image = cv2.imdecode(
+            np.frombuffer(ai_jpeg, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert decoded_ai_image is not None
+        assert max(decoded_ai_image.shape[:2]) <= int(
+            config["ai"]["image"]["max_long_side_px"]
+        )
+
     # 模拟Depth完全丢失，但2D人体接近水平。
     fallback_intrinsics = {
         "width": 100,
@@ -2406,7 +2451,7 @@ def run_self_test(config: dict) -> None:
 
     print("main integration self-test: PASS")
     print(
-        "  projection, Seg mask, P/H/V/S/C, "
+        "  projection, Seg mask, single-image request, P/H/V/S/C, "
         "missing-3D fallback, AI async/fusion/alert=PASS"
     )
 
