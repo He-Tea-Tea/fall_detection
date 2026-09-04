@@ -100,6 +100,8 @@ from velocity import (
     run_self_test as velocity_self_test,
 )
 
+from http_bridge import HttpBridge
+
 BASE_DIR = Path(__file__).resolve().parent
 
 # 每个功能文件不带--self-test运行时，都会调用main.py并选择对应stage。
@@ -1793,6 +1795,19 @@ def run_live(
             "当前跳过AI并直接使用本地判断"
         )
 
+    # ===== HTTP 桥接：发送融合结果 + 接收对端重置请求 =====
+    bridge = HttpBridge(config)
+
+    def reset_all_judgement():
+        """对端请求重置：清空所有人历史，使下次跌倒能重新报警。"""
+        for person_id in list(last_seen_s.keys()):
+            reset_person(person_id)
+        last_seen_s.clear()
+
+    if alert_manager is not None:
+        alert_manager.register_handler(bridge.handle_alert)  # FALL 翻转 -> POST true/false
+    bridge.start_server(reset_all_judgement)
+
     def reset_person(person_id: int) -> None:
         """一个Track ID离场后清除该人的全部历史。"""
         pose_3d_detector.reset_person(person_id)
@@ -2255,8 +2270,10 @@ def run_live(
     finally:
         if ai_coordinator is not None:
             ai_coordinator.close()
+        if bridge is not None:
+                    bridge.stop()
         if pipeline_started:
-            pipeline.stop()
+            pipeline.stop() 
         cv2.destroyAllWindows()
         print("Camera stopped")
 

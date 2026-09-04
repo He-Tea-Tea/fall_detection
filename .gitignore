@@ -1,16 +1,26 @@
-# 忽略日志目录
-Log/
-
-# 忽略 Python 缓存
+# Python缓存
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 
-# 忽略可能的模型文件（如果你不想提交大文件）
-*.pt
-*.pth
-*.onnx
+# 环境与密钥
+.env
+.env.*
+*.key
 
-# 忽略临时文件
+# AI调试图片
+debug_ai/
+
+# IDE
+.vscode/
+.idea/
+
+# 日志
 *.log
+
+# 模型权重
+*.pt
+*.onnx
+*.engine
+
+# 临时文件
 *.tmp

@@ -180,7 +180,7 @@ ai:                                         # ai_verifier.py：本地疑似后�
   provider: volcengine_ark                  # 服务提供方标识，后续更换AI厂商时用于选择适配器
   base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟OpenAI兼容API根地址
   api_key_env: ARK_API_KEY                  # 推荐使用的环境变量名
-  api_key: "ark-39c88c0a-d31c-4496-a1e9-a5900df16eab-34585"         # 可选明文密钥；只在本机填写，提交或发给别人前必须清空
+  api_key: ""                              # 建议留空，通过ARK_API_KEY环境变量读取，避免密钥泄露
   model: doubao-seed-evolving               # 模型或ep接入点ID；必须先在方舟控制台开通视觉能力
   supports_vision: true                     # 本流程必须为true，因为每次请求都会上传一张图片
   request:                                  # Responses API与后台线程参数
@@ -215,6 +215,11 @@ ai:                                         # ai_verifier.py：本地疑似后�
   network:                                  # 失败后暂停调用，断网期间不反复占用线程
     backoff_initial_s: 3.0                  # 第一次失败后跳过AI的秒数
     backoff_max_s: 60.0                     # 连续失败时最大退避秒数
+  debug:                                    # AI链路调试；正式部署时可关闭
+    enabled: true                           # true输出编码、提交、返回和退避日志
+    save_trigger_image: false               # true保存实际上传帧；平时建议false保护隐私和磁盘
+    save_directory: debug_ai                # 调试图片目录，相对路径按项目目录解析
+    max_saved_images: 100                   # 最多保留的触发图片数量，超出后删除最旧图片
   fusion:                                   # decision_fusion.py：明确AI回答优先，本地负责降级
     min_ai_confidence: 0.60                 # AI结果达到该内部置信度才允许覆盖本地结果
     ai_can_clear_local_fall: true            # true允许AI的false短暂覆盖本地FALL；安全优先可改false
@@ -226,6 +231,16 @@ ai:                                         # ai_verifier.py：本地疑似后�
 alerts:                                     # alert_manager.py：后续机器人动作和通知统一入口
   enabled: true                             # 是否生成最终FALL和恢复事件
   console_enabled: true                     # 当前是否在终端打印告警；不会自动控制机器人
+
+#--------------------------------------http_bridge-------------------------------------#
+http_bridge:                                # 与同机独立程序 HTTP 通讯（可选）
+  enabled: true                             # 设为 false 则只打印不发
+  target_url: http://127.0.0.1:8080/fall    # 对端独立程序接收地址，改成实际值
+  listen_host: 127.0.0.1                    # 本程序接收 /reset 的监听地址
+  listen_port: 8123                         # 本程序监听端口（别和对端端口撞）
+  timeout_s: 2.0                            # 单次发送超时；后台发送不会阻塞相机
+  retry_count: 2                            # 首次失败后最多再重试的次数
+  retry_interval_s: 0.3                     # 两次发送尝试之间的等待时间（秒）
 
 #--------------------------------------display-------------------------------------#
 display:                                    # OpenCV可视化

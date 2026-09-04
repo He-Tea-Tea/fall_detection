@@ -162,6 +162,11 @@ class ArkResponsesClient:
         self._sdk_client_key = ""
 
     @property
+    def debug_enabled(self) -> bool:
+        """是否输出不包含API Key和Base64正文的安全调试日志。"""
+        return bool(self.cfg.get("debug", {}).get("enabled", False))
+
+    @property
     def api_key(self) -> str:
         """优先读取用户填写的ai.api_key，留空时再读取环境变量。"""
         config_key = str(self.cfg.get("api_key", "")).strip()
@@ -373,10 +378,26 @@ class ArkResponsesClient:
                     f"未找到API Key，请设置{self.api_key_env}或ai.api_key"
                 )
             payload = self.build_payload(request)
+            if self.debug_enabled:
+                image_size_kb = len(observation.image_jpeg or b"") / 1024.0
+                print(
+                    "[AI DEBUG] API请求开始："
+                    f"ID={request.person_id} event={request.event_id} "
+                    f"local={observation.local_fall_score:.2f} "
+                    f"jpeg={image_size_kb:.1f}KB model={self.model}"
+                )
             response = self._request_api(payload)
             raw_answer = self._extract_answer_text(response)
             verdict, confidence, reason, observations = self._parse_answer(raw_answer)
             completed_s = time.monotonic()
+            if self.debug_enabled:
+                print(
+                    "[AI DEBUG] API请求完成："
+                    f"ID={request.person_id} verdict={verdict} "
+                    f"confidence={confidence:.2f} "
+                    f"latency={completed_s - started_s:.2f}s "
+                    f"answer={raw_answer!r}"
+                )
             return AIVerificationResult(
                 event_id=request.event_id,
                 person_id=request.person_id,
@@ -398,6 +419,12 @@ class ArkResponsesClient:
             )
         except Exception as error:
             completed_s = time.monotonic()
+            if self.debug_enabled:
+                print(
+                    "[AI DEBUG] API请求失败，改用本地判断："
+                    f"ID={request.person_id} latency={completed_s - started_s:.2f}s "
+                    f"error={type(error).__name__}: {error}"
+                )
             return AIVerificationResult(
                 event_id=request.event_id,
                 person_id=request.person_id,
@@ -504,9 +531,15 @@ class AIFallCoordinator:
         self.latest_results: Dict[int, AIVerificationResult] = {}
         self.consecutive_risk: Dict[int, int] = defaultdict(int)
         self.last_submit_s: Dict[int, float] = {}
+        self.latest_local_score: Dict[int, float] = {}
         self.ignored_event_ids: Set[str] = set()
         self.failure_count = 0
         self.backoff_until_s = 0.0
+
+    @property
+    def debug_enabled(self) -> bool:
+        """读取AI调试开关。"""
+        return bool(self.cfg.get("debug", {}).get("enabled", False))
 
     @property
     def supports_vision(self) -> bool:
@@ -555,6 +588,9 @@ class AIFallCoordinator:
         image_provider: Optional[Callable[[], Optional[bytes]]] = None,
     ) -> bool:
         """风险达到0.50时获取当前单帧并异步提交；返回是否提交成功。"""
+        self.latest_local_score[int(observation.person_id)] = float(
+            observation.local_fall_score
+        )
         if not self._request_allowed(observation):
             return False
 
@@ -573,11 +609,19 @@ class AIFallCoordinator:
             frame=observation,
         )
         if not self.verifier.submit(verification_request):
+            if self.debug_enabled:
+                print(f"[AI DEBUG] 请求队列已满，本次跳过：ID={person_id}")
             return False
 
         self.pending_people[person_id] = event_id
         self.last_submit_s[person_id] = now
         self.consecutive_risk[person_id] = 0
+        if self.debug_enabled:
+            print(
+                "[AI DEBUG] 单图请求已提交后台线程："
+                f"ID={person_id} event={event_id} "
+                f"FallScore={observation.local_fall_score:.2f}"
+            )
         return True
 
     def poll(self, now_s: Optional[float] = None) -> List[AIVerificationResult]:
@@ -605,6 +649,11 @@ class AIFallCoordinator:
                     float(network_cfg["backoff_max_s"]),
                 )
                 self.backoff_until_s = now + delay
+                if self.debug_enabled:
+                    print(
+                        "[AI DEBUG] 进入网络退避："
+                        f"连续失败={self.failure_count}，暂停={delay:.1f}s"
+                    )
         return accepted_results
 
     def latest_result(
@@ -652,6 +701,26 @@ class AIFallCoordinator:
                 False,
                 f"网络失败，{remaining:.1f}秒内跳过AI",
             )
+        local_score = self.latest_local_score.get(person_id)
+        trigger_score = float(self.cfg["trigger"]["fall_score"])
+        if local_score is not None and local_score < trigger_score:
+            return AIPersonStatus(
+                "LOCAL_LOW",
+                result,
+                False,
+                f"本地分数{local_score:.2f}低于触发值{trigger_score:.2f}",
+            )
+        last_submit = self.last_submit_s.get(person_id)
+        if last_submit is not None:
+            cooldown_s = float(self.cfg["trigger"]["cooldown_s"])
+            remaining = cooldown_s - (now - last_submit)
+            if remaining > 0.0 and result is None:
+                return AIPersonStatus(
+                    "COOLDOWN",
+                    None,
+                    False,
+                    f"等待{remaining:.1f}秒后允许再次复核",
+                )
         if result is not None and not result.success:
             return AIPersonStatus("ERROR", result, False, result.error)
         if (
@@ -681,6 +750,7 @@ class AIFallCoordinator:
         self.latest_results.pop(person_id, None)
         self.consecutive_risk.pop(person_id, None)
         self.last_submit_s.pop(person_id, None)
+        self.latest_local_score.pop(person_id, None)
 
     def close(self) -> None:
         """关闭后台线程池。"""
