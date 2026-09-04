@@ -180,16 +180,38 @@ ai:                                         # ai_verifier.py：事件触发的�
   provider: volcengine_ark                  # AI服务提供方标识，为后续更换服务预留
   base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟兼容OpenAI的API根地址
    # API密钥环境变量名，密钥本身绝不能写入本文件  终端运行 ,  $env:ARK_API_KEY="你的API密钥"
-  api_key_env: ARK_API_KEY                 
+  api_key_env: ARK_API_KEY
+  api_key: "ark-39c88c0a-d31c-4496-a1e9-a5900df16eab-34585"                 
   model: doubao-seed-evolving              # 当前文本模型；只读取本地结构化检测数据
   supports_vision: true                     # 当前模型不能看图；以后换视觉模型时改为true
   request:                                  # 单次网络请求和后台任务参数
     timeout_s: 5.0                          # 请求最长等待时间，超时后立即退回本地判断
-    max_tokens: 500                         # AI结构化回答最大Token数
+    max_tokens: 50                         # AI结构化回答最大Token数
     temperature: 0.0                        # 0表示回答更稳定，适合固定JSON判断任务
+    thinking_enabled: false                 # 新增：是否启用深度思考
+    # 如果模型支持 reasoning_effort，可添加：
+    # reasoning_effort: medium              # low/medium/high
     force_json_response: false              # 是否发送JSON响应格式参数；旧模型不支持时保持false
     max_workers: 1                          # 后台AI线程数，1可避免同时请求过多占用带宽
     max_pending_requests: 2                 # 最多允许多少个未完成请求，队列满时跳过新请求
+  # ====== 新增以下内容 ======
+  prompt:
+    prompt:
+    text: |
+      你是一位跌倒检测专家。根据这张单帧图片，判断图片中是否存在任何一个人躺在地面（硬地板、地砖等）上，而不是在床上、沙发、椅子等家具上，
+      并且姿态异常（非受控的坐下、蹲下、弯腰等）。
+
+      规则：
+      - 如果图片中有任何一个人躺或坐在地上（非家具），且姿态不正常，回答：true。
+      - 如果所有人都在家具上，或所有人姿态正常（站立、行走、正常坐下、蹲下等），回答：false。
+      - 只要存在一个人符合跌倒条件，就回答 true。
+
+      只输出 true 或 false，不要其他内容。
+
+      请分析图片。
+    image_url: ""   # 测试时可留空，实际使用时由代码动态传入
+  # ==========================
+
   trigger:                                  # 哪些本地事件需要调用AI，不采用固定每秒上传
     fall_score: 0.45                        # 本地总分达到该值后开始积累AI触发帧
     min_pose_score: 0.50                    # AI触发还要求P至少达到该值

@@ -30,6 +30,9 @@ Ubuntu当前终端：
 export ARK_API_KEY="你的API密钥"
 ```
 
+```bash
+pip install --upgrade "openai>=1.0"
+```
 如果火山方舟要求使用推理接入点ID，把`config.yaml`中的`ai.model`改成控制台提供的`ep-...`，其他代码不用修改。
 
 本版使用Python标准库发送HTTPS请求，不需要额外安装`openai`或火山方舟SDK。

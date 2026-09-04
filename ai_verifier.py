@@ -270,9 +270,22 @@ class ArkChatClient:
         self.supports_vision = bool(self.cfg["supports_vision"])
         self.transport = transport
 
+    # @property
+    # def api_key(self) -> str:
+    #     """优先读取config.yaml中的密钥；没有填写时再读取环境变量。"""
+    #     config_key = str(self.cfg.get("api_key", "")).strip()
+    #     if config_key:
+    #         return config_key
+        # return os.environ.get(self.api_key_env, "").strip()
+
     @property
     def api_key(self) -> str:
-        """每次请求时读取环境变量，允许程序启动后再注入密钥。"""
+        # 直接取，不提前转 str
+        config_key = self.cfg.get("api_key")
+        # 判断：既不是 None，也不是空字符串，并且去除空格后还有内容
+        if config_key is not None and str(config_key).strip():
+            return str(config_key).strip()
+        # 回退到环境变量
         return os.environ.get(self.api_key_env, "").strip()
 
     @property
