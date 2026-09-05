@@ -17,10 +17,10 @@
 """
 
 import argparse
-from collections import defaultdict, deque
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -63,6 +63,27 @@ class HeightScoreResult:
     baseline_height_m: Optional[float]
     drop_m: Optional[float]
     valid: bool
+    drop_valid: bool = False
+    absolute_valid: bool = False
+    jump_pending: bool = False
+    reason: str = "OK"
+
+
+@dataclass
+class _HeightMemory:
+    """一个人的已确认髋高历史和跳变候选。"""
+
+    history_length: int
+    history: Deque[Tuple[float, float]] = field(init=False)
+    last_seen_s: Optional[float] = None
+    last_accepted_height_m: Optional[float] = None
+    last_accepted_s: Optional[float] = None
+    pending_height_m: Optional[float] = None
+    pending_count: int = 0
+    pending_since_s: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.history = deque(maxlen=self.history_length)
 
 
 def load_config(path: str) -> dict:
@@ -169,19 +190,90 @@ class HeightScorer:
                 "正常髋高必须大于跌倒髋高"
             )
 
-        # histories按照person_id分别保存(timestamp, hip_height)。
-        self.histories: Dict[int, deque] = defaultdict(
-            lambda: deque(maxlen=self.history_length)
+        jump_cfg = self.cfg.get("jump_guard", {})
+        self.jump_guard_enabled = bool(jump_cfg.get("enabled", True))
+        self.max_instant_jump_m = float(jump_cfg.get("max_instant_jump_m", 0.30))
+        self.jump_confirm_frames = int(jump_cfg.get("confirm_frames", 2))
+        self.jump_confirm_tolerance_m = float(jump_cfg.get("confirmation_tolerance_m", 0.12))
+        self.jump_max_interval_s = float(jump_cfg.get("max_interval_s", 0.60))
+        if self.max_instant_jump_m <= 0.0 or self.jump_confirm_frames <= 0:
+            raise ValueError("height_score.jump_guard参数必须大于0")
+
+        # 每个人单独保存历史，避免不同Track ID互相污染。
+        self.people: Dict[int, _HeightMemory] = {}
+
+    def _person(self, person_id: int) -> _HeightMemory:
+        """获取一个人的高度记忆，第一次出现时自动创建。"""
+        person_id = int(person_id)
+        if person_id not in self.people:
+            self.people[person_id] = _HeightMemory(self.history_length)
+        return self.people[person_id]
+
+    @staticmethod
+    def _invalid(reason: str, jump_pending: bool = False) -> HeightScoreResult:
+        """构造不会参与最终加权、也不会污染历史的无效结果。"""
+        return HeightScoreResult(
+            score=0.0,
+            drop_score=0.0,
+            low_height_score=0.0,
+            hip_height_m=None,
+            baseline_height_m=None,
+            drop_m=None,
+            valid=False,
+            drop_valid=False,
+            absolute_valid=False,
+            jump_pending=jump_pending,
+            reason=reason,
         )
 
-        # 保存每个人最后一次更新时间，用于检查时间戳是否倒退。
-        self.last_seen: Dict[int, float] = {}
+    def _confirm_height(self, memory: _HeightMemory, now: float, current: float) -> bool:
+        """拒绝单帧大跳变；新高度连续出现后才接受为真实运动。"""
+        if (
+            not self.jump_guard_enabled
+            or memory.last_accepted_height_m is None
+            or memory.last_accepted_s is None
+            or now - memory.last_accepted_s > self.jump_max_interval_s
+        ):
+            memory.pending_height_m = None
+            memory.pending_count = 0
+            memory.pending_since_s = None
+            return True
+        if abs(current - memory.last_accepted_height_m) <= self.max_instant_jump_m:
+            memory.pending_height_m = None
+            memory.pending_count = 0
+            memory.pending_since_s = None
+            return True
+
+        pending_expired = (
+            memory.pending_since_s is None
+            or now - memory.pending_since_s > self.jump_max_interval_s
+        )
+        pending_changed = (
+            memory.pending_height_m is None
+            or abs(current - memory.pending_height_m) > self.jump_confirm_tolerance_m
+        )
+        if pending_expired or pending_changed:
+            memory.pending_height_m = current
+            memory.pending_count = 1
+            memory.pending_since_s = now
+            return self.jump_confirm_frames <= 1
+
+        memory.pending_count += 1
+        memory.pending_height_m = current
+        if memory.pending_count < self.jump_confirm_frames:
+            return False
+        memory.pending_height_m = None
+        memory.pending_count = 0
+        memory.pending_since_s = None
+        return True
 
     def update(
         self,
         person_id: int,
         timestamp_s: float,
         hip_height_m: Optional[float],
+        ground_valid: bool = True,
+        measurement_valid: bool = True,
     ) -> HeightScoreResult:
         """更新一名人员的髋部高度并计算高度风险分H。
 
@@ -193,32 +285,29 @@ class HeightScorer:
         返回：
             HeightScoreResult高度评分结果。
         """
-        person_id = int(person_id)
-        now = float(timestamp_s)
+        person_id, now = int(person_id), float(timestamp_s)
+        memory = self._person(person_id)
 
         # 同一个人的时间必须一直向前，时间倒退会破坏历史窗口计算。
-        previous_time = self.last_seen.get(person_id)
+        previous_time = memory.last_seen_s
         if previous_time is not None and now < previous_time:
             raise ValueError(
                 "同一人员timestamp_s不能倒退"
             )
 
-        self.last_seen[person_id] = now
+        memory.last_seen_s = now
+
+        if not measurement_valid:
+            return self._invalid("当前3D几何或地面不可信")
 
         # 髋高缺失、NaN或无穷大时，不写入历史，也不编造风险分。
         if hip_height_m is None or not np.isfinite(hip_height_m):
-            return HeightScoreResult(
-                score=0.0,
-                drop_score=0.0,
-                low_height_score=0.0,
-                hip_height_m=None,
-                baseline_height_m=None,
-                drop_m=None,
-                valid=False,
-            )
+            return self._invalid("髋高缺失")
 
         current_height = float(hip_height_m)
-        history = self.histories[person_id]
+        if not self._confirm_height(memory, now, current_height):
+            return self._invalid("髋高发生单帧跳变，等待连续帧确认", jump_pending=True)
+        history = memory.history
 
         # 只选择位于规定时间窗口内、并且足够早的历史高度。
         # 排除离当前太近的数据，可以防止使用几乎相同的两帧计算下降量。
@@ -253,11 +342,16 @@ class HeightScorer:
                 self.drop_full_m,
             )
 
-        # 当前髋部越接近地面，绝对低高度分越高。
-        low_height_score = _decreasing_score(
-            current_height,
-            self.hip_height_normal_m,
-            self.hip_height_fall_m,
+        # 绝对低高度强依赖地面平面；地面不可信时明确禁用这一项。
+        absolute_valid = bool(ground_valid)
+        low_height_score = (
+            _decreasing_score(
+                current_height,
+                self.hip_height_normal_m,
+                self.hip_height_fall_m,
+            )
+            if absolute_valid
+            else 0.0
         )
 
         # 两项取最大值：
@@ -271,6 +365,8 @@ class HeightScorer:
         history.append(
             (now, current_height)
         )
+        memory.last_accepted_height_m = current_height
+        memory.last_accepted_s = now
 
         return HeightScoreResult(
             score=final_score,
@@ -280,6 +376,10 @@ class HeightScorer:
             baseline_height_m=baseline_height,
             drop_m=drop_m,
             valid=True,
+            drop_valid=drop_m is not None,
+            absolute_valid=absolute_valid,
+            jump_pending=False,
+            reason="OK" if absolute_valid else "地面不可信，已禁用绝对低高度",
         )
 
     def reset_person(self, person_id: int) -> None:
@@ -288,9 +388,7 @@ class HeightScorer:
         人员离开画面或Track ID失效后必须清除，避免以后复用相同ID时
         继承其他人员的历史髋部高度。
         """
-        person_id = int(person_id)
-        self.histories.pop(person_id, None)
-        self.last_seen.pop(person_id, None)
+        self.people.pop(int(person_id), None)
 
 
 def run_self_test(config: dict) -> None:
@@ -312,24 +410,35 @@ def run_self_test(config: dict) -> None:
     )
 
     # 第3帧：髋部下降到0.25米，应获得很高的高度风险分。
-    fallen = scorer.update(
+    pending = scorer.update(
         person_id=1,
         timestamp_s=0.4,
         hip_height_m=0.25,
+    )
+    fallen = scorer.update(
+        person_id=1,
+        timestamp_s=0.5,
+        hip_height_m=0.26,
     )
 
     assert normal.valid
     assert normal.score == 0.0
 
-    assert fallen.valid
+    assert not pending.valid and pending.jump_pending
+    assert fallen.valid and fallen.drop_valid and fallen.absolute_valid
     assert fallen.drop_m is not None
     assert fallen.drop_m > 0.5
     assert fallen.score > 0.95
 
+    # 地面失效时仍可保留已确认的相对下降分，但绝对低高度必须关闭。
+    no_absolute = scorer.update(2, 0.0, 0.20, ground_valid=False)
+    assert no_absolute.valid and not no_absolute.absolute_valid
+    assert no_absolute.low_height_score == 0.0
+
     print("height self-test: PASS")
     print(
         "  normal hip height, historical drop, "
-        "absolute low height=PASS"
+        "jump guard, relative drop, ground-aware absolute height=PASS"
     )
 
 

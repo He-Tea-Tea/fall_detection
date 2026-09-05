@@ -24,7 +24,7 @@ camera:                                     # RGB-D取帧与标定一致性检�
   frame_timeout_ms: 1000                    # 正常运行等待一组帧的最长时间，单位毫秒
   first_frame_timeout_ms: 3000              # 启动时每次等待首帧的最长时间，单位毫秒
   first_frame_retries: 10                   # 首帧最大重试次数
-  strict_ground_calibration: true           # 内参与标定不一致时是否禁止运行
+  strict_ground_calibration: true           # 在线地面管理关闭时，不一致是否禁止运行；开启时改为警告并重估
   focal_relative_tolerance: 0.02            # fx/fy允许相对误差，0.02表示2%
   principal_point_tolerance_px: 5.0         # cx/cy允许误差，单位像素
 
@@ -34,6 +34,42 @@ depth:                                      # 深度与3D反投影
   max_depth_m: 6.00                         # 最大有效深度，单位米
   window_size: 5                            # 关键点深度中值窗口边长，必须为正奇数
   min_valid_samples: 3                      # 窗口内最少有效深度像素数
+
+#--------------------------------------ground_manager-------------------------------------#
+ground_manager:                             # 在线地面质量评估与相机移动后的自动重估
+  enabled: true                             # true持续检查地面；ground_detector.py仍保留为初始标定工具
+  update_interval_frames: 5                 # 每隔多少帧执行一次轻量地面RANSAC，调大更省CPU
+  roi_start_ratio: 0.52                     # 只从画面该纵向比例以下找地面，0.52表示下方48%
+  sample_step_px: 6                         # 深度图稀疏采样步长，调大更快但候选点更少
+  person_box_margin_ratio: 0.08             # 在线拟合时人体框向外扩张并排除的比例
+  min_points: 120                           # 执行RANSAC至少需要的有效3D候选点数
+  ransac_iterations: 80                     # 每次地面估计的随机采样次数
+  ransac_distance_threshold_m: 0.035        # 点到候选平面小于3.5厘米才算内点
+  min_inlier_ratio: 0.28                    # 至少28%候选点属于同一大平面
+  target_inlier_ratio: 0.60                 # 内点比例达到60%时质量子分记满
+  max_rmse_m: 0.030                         # 平面内点RMSE达到3厘米时残差质量降为0
+  coverage_grid_x: 5                        # 水平方向覆盖率网格数量
+  coverage_grid_y: 3                        # 垂直方向覆盖率网格数量
+  min_coverage_ratio: 0.27                  # 内点至少覆盖27%网格，防止局部桌面被当成地面
+  target_coverage_ratio: 0.55               # 覆盖55%网格时覆盖质量子分记满
+  camera_height_min_m: 0.35                 # 相机到候选地面最小合理距离
+  camera_height_max_m: 2.50                 # 相机到候选地面最大合理距离
+  min_abs_normal_y: 0.20                    # 地面法向量Y分量下限，用于排除侧墙等竖直平面
+  max_recalibration_angle_deg: 55.0         # 单次自动重估相对旧地面的最大允许角度
+  quality_weights:                          # ground_quality四项权重，总和必须等于1
+    inlier_ratio: 0.35                      # 大平面内点比例权重
+    residual: 0.25                          # 平面拟合残差权重
+    coverage: 0.25                          # 平面在画面中的覆盖范围权重
+    camera_height: 0.15                     # 相机高度合理性权重
+  min_quality: 0.60                         # 质量达到该值才允许3D地面相关维度工作
+  stable_frames: 3                          # 新候选平面连续稳定多少次后才接受
+  stable_angle_deg: 4.0                     # 连续候选法向量最大夹角
+  stable_offset_m: 0.08                     # 连续候选相机高度最大差值
+  plane_change_angle_deg: 2.0               # 相对当前平面超过该角度视为相机发生转动
+  plane_change_offset_m: 0.05               # 相对当前平面高度变化超过该值视为地面切换
+  bad_frame_grace: 2                        # 短暂拟合失败允许保留SUSPECT的次数
+  history_warmup_s: 0.8                     # 接受新平面后暂停H/V/S历史更新的预热时间
+  random_seed: 2026                         # RANSAC随机种子，便于复现实验结果
 
 #--------------------------------------pose-------------------------------------#
 pose:                                       # 人体基础观测质量，不是姿态评分
@@ -78,6 +114,14 @@ pose_fusion:                                # 姿态维度P只融合两个已经
     pose_3d: 0.45                           # 三维姿态子分P3D权重
     pose_2d: 0.55                           # 二维姿态子分P2D权重；保持原二维角度35%+人框20%
 
+#--------------------------------------measurement_guard-------------------------------------#
+measurement_guard:                         # 人体3D几何与2D/3D姿态一致性保护
+  max_left_right_depth_difference_m: 0.35  # 左右髋深度差超过35厘米时认为至少一侧Depth错误
+  min_torso_length_m: 0.12                 # 肩中心到髋中心最小合理3D长度
+  max_torso_length_m: 0.90                 # 肩中心到髋中心最大合理3D长度
+  pose_conflict_angle_deg: 40.0             # 统一角度后2D和3D相差40°视为冲突帧
+  pose_conflict_confirm_frames: 3           # 冲突连续3帧后禁用3D链路，过滤单帧抖动
+
 #--------------------------------------height_score-------------------------------------#
 height_score:                               # height.py：高度维度H
   history_length: 120                       # 每个人最多保存的髋高历史条数
@@ -87,6 +131,12 @@ height_score:                               # height.py：高度维度H
   drop_full_m: 0.50                         # 髋部下降达到该值记满分，单位米
   hip_height_normal_m: 0.55                 # 当前髋高达到该值时低高度分为0
   hip_height_fall_m: 0.25                   # 当前髋高低于该值时低高度分为1
+  jump_guard:                               # 防止Depth飞点直接污染H/V历史
+    enabled: true                           # 是否启用髋高跳变确认
+    max_instant_jump_m: 0.30                # 相邻已确认髋高相差超过30厘米时先视为可疑
+    confirm_frames: 2                       # 新高度连续出现2帧后才接受为真实快速运动
+    confirmation_tolerance_m: 0.12          # 连续候选高度彼此允许的最大差值
+    max_interval_s: 0.60                    # 候选帧间隔超过该值后重新开始确认
 
 #--------------------------------------velocity_score---------------------------------------#
 velocity_score:                             # velocity.py：下降速度维度V
@@ -165,7 +215,7 @@ fall_detector:                              # fall_detector.py：只做五项加
     confirm_duration_s: 1.0                 # 跌倒证据连续保持时间，单位秒
     recover_duration_s: 2.0                 # 恢复证据连续保持时间，单位秒
     transient_evidence_hold_s: 3.0          # 下降/速度瞬态证据保留时间
-    transient_height_score: 0.50            # H达到该值时锁存瞬态证据
+    transient_height_score: 0.50            # 仅真实drop_score达到该值时锁存，绝对低高度不能触发
     transient_velocity_score: 0.50          # V达到该值时锁存瞬态证据
     min_pose_score: 0.50                    # 确认FALL所需最低P
     min_height_score: 0.45                  # 确认FALL所需最低H，或使用已锁存瞬态证据
@@ -187,7 +237,7 @@ ai:                                         # ai_verifier.py：本地疑似后�
   provider: volcengine_ark                  # 服务提供方标识，后续更换AI厂商时用于选择适配器
   base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟OpenAI兼容API根地址
   api_key_env: ARK_API_KEY                  # 推荐使用的环境变量名
-  api_key: "ark-39c88c0a-d31c-4496-a1e9-a5900df16eab-34585"    # 建议留空，通过ARK_API_KEY环境变量读取，避免密钥泄露
+  api_key: ""                              # 必须留空，通过ARK_API_KEY环境变量读取，避免密钥进入Git
   model: doubao-seed-evolving               # 模型或ep接入点ID；必须先在方舟控制台开通视觉能力
   supports_vision: true                     # 本流程必须为true，因为每次请求都会上传一张图片
   request:                                  # Responses API与后台线程参数
@@ -209,8 +259,23 @@ ai:                                         # ai_verifier.py：本地疑似后�
       发现至少一人明显跌倒在地面回答 true；明确没有跌倒回答 false。
       只能输出 true、false 或 uncertain，不要解释，不要添加标点。
   trigger:                                  # 本地结果何时触发一次单图上传
-    fall_score: 0.60                        # 本地FallScore达到0.60时触发AI复核
-    consecutive_frames: 2                   # 2表示需要连续2帧满足条件才提交，过滤单帧抖动
+    fall_score: 0.60                        # 本地已确认FALL路径仍要求总分达到该值
+    min_pose_score: 0.50                    # 本地已确认FALL路径所需最低姿态分
+    min_data_quality: 0.50                  # 两条AI触发路径共同要求的最低图像/测量质量
+    consecutive_frames: 2                   # 兼容旧配置，强疑似路径默认由下一项控制
+    suspicious_consecutive_frames: 4        # 本地未确认时强疑似需连续4帧，避免瞬时误上传
+    episode_reset_score: 0.35               # 本地总分回落到该值以下才结束一次AI事件
+    episode_reset_pose_2d_score: 0.35       # P2D也恢复到该值以下才允许下一事件重新上传
+    suspicious:                             # 防止本地漏报的第二条AI安全触发路径
+      enabled: true                         # 是否允许“本地未确认但多证据强疑似”上传
+      min_pose_2d_score: 0.80               # 强疑似必须先有明显水平的可靠P2D
+      min_height_drop_score: 0.55            # 真实历史高度下降支持阈值
+      min_velocity_score: 0.55              # 可靠向下速度支持阈值
+      min_floor_confidence: 0.60             # lying_on_floor关系最低置信度
+      min_local_score: 0.55                 # 本地总分可作为一个辅助支持证据
+      min_support_count: 1                  # P2D之外至少需要多少项支持证据
+      ground_invalid_pose_2d_score: 0.90    # 地面失效兜底路径所需更高P2D
+      ground_invalid_local_score: 0.75      # 地面失效兜底路径所需最低降级总分
     cooldown_s: 5.0                         # 同一人持续疑似时最短复查间隔，单位秒
     fall_recheck_s: 10.0                    # 本地已经FALL时的最短AI复查间隔，单位秒
     result_ttl_s: 20.0                      # 最新明确AI结果可被融合层读取的最长时间
@@ -259,6 +324,7 @@ logging:                                    # 统一终端日志和自动轮转�
   max_file_size_mb: 10                      # 单个日志达到10MB后自动轮转
   backup_count: 5                           # 最多保留5份历史日志
   repeated_warning_interval_s: 5.0          # 相同高频警告最短输出间隔，单位秒
+  local_risk_interval_s: 2.0                # 同一人员本地高风险详细日志最短输出间隔
 
 #--------------------------------------display-------------------------------------#
 display:                                    # OpenCV可视化
@@ -279,6 +345,7 @@ display:                                    # OpenCV可视化
   show_scene_masks: true                    # 是否显示家具Mask
   scene_mask_alpha: 0.35                    # 家具Mask透明度
   show_debug_text: false                    # false隐藏人体框下面的白色参数
+  show_ground_status: true                  # 左上角显示在线地面状态和ground_quality
   font_scale: 0.50                          # 主标签字体大小
   line_height_px: 18                        # 数据文字行距，单位像素
 

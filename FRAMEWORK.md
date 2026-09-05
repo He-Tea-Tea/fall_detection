@@ -18,22 +18,20 @@
 - `pose_2D.py`只计算二维角度、人框比例和`P2D`。
 - `fuse_pose_dimension()`只融合已经算好的`P3D/P2D`，不重新计算角度。
 
-## 2. 新版完整数据流
+## 2. v0.95完整数据流
 
 ```mermaid
 flowchart TD
-    A[main.py采集RGB-D并运行YOLO26] --> B[人体框、ID、2D/3D关键点]
-    B --> C[pose_3D输出P3D]
-    B --> D[pose_2D输出P2D]
-    C --> E[融合为姿态分P]
-    D --> E
-    B --> F[height/velocity/static/scene输出H/V/S/C]
-    E --> G[fall_detector二值判断]
-    F --> G
-    G --> H[ai_verifier事件触发复核]
-    G --> I[decision_fusion最终判断]
-    H --> I
-    I --> J[alert_manager告警事件]
+    A[采集RGB-D与YOLO] --> B[地面质量与自动重估]
+    A --> C[人体2D/3D测量]
+    B --> D[3D证据可用性]
+    C --> D
+    D --> E[P/H/V/S/C与二值状态机]
+    E --> F[本地确认或强疑似]
+    F --> G[单图AI复核]
+    E --> H[最终融合]
+    G --> H
+    H --> I[告警/HTTP/音频]
 ```
 
 程序的实际执行顺序是：
@@ -41,13 +39,14 @@ flowchart TD
 1. `main.py`获取RGB和Depth，并把Depth对齐到RGB画面。
 2. YOLO26 Pose检测人体框、17个关键点并维持Track ID。
 3. YOLO26 Seg检测床、沙发、椅子的实例Mask。
-4. `main.py`把2D关键点结合Depth反投影为3D关键点。
-5. 六个特征文件分别计算`P3D、P2D、H、V、S、C`。
-6. `P3D`和`P2D`融合为五维中的姿态分`P`。
-7. `fall_detector.py`加权`P/H/V/S/C`，只输出`FALL`或`NO_FALL`。
-8. 本地`FallScore`达到0.50时，`ai_verifier.py`异步上传当前一张RGB图片。
-9. `decision_fusion.py`优先采用明确AI回答，AI不可用时使用本地结果。
-10. 最终状态变化由`alert_manager.py`转换成可扩展的告警事件。
+4. `ground_manager.py`从排除人体和家具后的Depth检查地面质量，必要时自动重估。
+5. `main.py`把2D关键点结合Depth反投影为3D关键点。
+6. `measurement_guard.py`检查人体3D几何，并检测2D/3D姿态持续冲突。
+7. 地面和人体几何可靠时计算`P3D、H、V、S、C`，否则保留`P2D`降级路径。
+8. `fall_detector.py`加权有效的`P/H/V/S/C`，只输出`FALL`或`NO_FALL`。
+9. 本地已确认FALL或多证据强疑似时，`ai_verifier.py`按事件异步上传一张RGB图片。
+10. `decision_fusion.py`优先采用明确AI回答，AI不可用时使用本地结果。
+11. 最终状态变化由`alert_manager.py`发给音频和HTTP等处理器。
 ### 完整流程图
 
 ![alt text](mermaid-diagram.png)
@@ -56,14 +55,15 @@ flowchart TD
 
 | 阶段              | 判断条件                      | 处理结果             |
 | --------------- | ------------------------- | ---------------- |
-| 本地触发AI          | `FallScore >= 0.50`       | 准备上传当前图片         |
-| 不触发AI           | `FallScore < 0.50`        | 不编码、不上传          |
+| 本地确认触发AI | `label=FALL`且分数、姿态、质量达标 | 立即准备一张图片 |
+| 强疑似触发AI | P2D水平，且下降/速度/地面关系/本地分至少一项支持，连续4帧 | 防止本地漏报 |
+| 地面失效兜底 | 地面无效，P2D和降级总分达到更严格阈值 | 仍可请求AI |
+| 一次风险事件 | 相同触发原因只提交一次 | 防止每5秒反复收费 |
 | 图片数量            | 每次1张                      | 当前完整RGB画面        |
 | 图片尺寸            | 原始画面`640×400`             | 不放大、不缩小          |
 | 图片压缩            | `jpeg_quality: 75`        | 减少上传大小           |
 | AI并发            | `max_pending_requests: 1` | 前一个请求未结束时不再提交    |
-| 普通疑似复查          | 距离上次请求至少5秒                | 可以再次上传           |
-| 本地FALL复查        | 距离上次请求至少10秒               | 可以再次上传           |
+| 事件升级 | 强疑似上传后本地正式确认FALL | 允许再提交一次 |
 | AI超时            | 默认10秒                     | 放弃本次AI，使用本地结果    |
 | 第一次网络退避         | 3秒                        | 暂停提交新AI请求        |
 | 连续网络失败          | 3、6、12、24、48、60秒          | 最长退避60秒          |
@@ -90,6 +90,8 @@ flowchart TD
 | 文件 | 输入 | 判断内容 | 输出 |
 |---|---|---|---|
 | `ground_detector.py` | RGB-D相机数据 | 拟合地面平面 | `ground.yaml` |
+| `ground_manager.py` | D2C Depth、人体框和家具Mask | 地面质量、在线重估和预热 | `GroundEstimate` |
+| `measurement_guard.py` | 2D/3D角度和人体3D关键点 | 深度几何与姿态冲突保护 | `MeasurementGuardResult` |
 | `pose_3D.py` | 3D关键点、关键点置信度、地面平面 | 3D人体方向 | `Pose3DResult`和`P3D` |
 | `pose_2D.py` | 2D关键点、关键点置信度、人体框 | 2D人体方向和框形状 | `Pose2DResult`和`P2D` |
 | `height.py` | Track ID、时间、髋部离地高度 | 高度下降和绝对低高度 | `HeightScoreResult`和`H` |
@@ -487,22 +489,33 @@ python main.py --stage full
 
 所有窗口按`Esc`退出。
 
-## 14. 地面标定不受本次拆分影响
+## 14. v0.95地面管理和误判保护
 
-`ground_detector.py`没有参与2D/3D模块重构，仍然独立生成`ground.yaml`。只有3D角度、髋高和场景3D高度依赖地面标定；2D角度不依赖。
+`ground_detector.py`保持不变，仍负责生成首次启动使用的`ground.yaml`。新增的`ground_manager.py`不会盲目信任旧标定，而是从画面下部Depth持续执行稀疏RANSAC，并用内点比例、拟合RMSE、画面覆盖率和相机高度合理性计算`ground_quality`。
 
-以下情况需要重新标定：
+地面状态包括：
+
+- `STARTUP`：已读取初始平面，但还没有通过当前画面验证。
+- `RECALIBRATING`：正在累计连续稳定的新平面。
+- `VALID`：质量和稳定帧均达标，允许使用地面相关3D证据。
+- `SUSPECT/INVALID`：地面不可信，立即停用P3D、H、V、S和地面场景关系，保留P2D。
+
+相机移动后，新平面连续稳定三次才被接受；接受后清空旧P3D/H/V/S场景历史，并预热0.8秒，防止两个坐标系的数据混在一起。无法看见足够地面时不会伪造新平面，而是保持2D降级并等待后续Depth恢复。
+
+`measurement_guard.py`还会检查左右髋深度差、3D躯干长度和2D/3D姿态冲突。2D角先转换成同样的“0°竖直、90°水平”定义，连续三帧相差超过40°时禁用3D链路。这正是对“2D明显站立、3D却接近90°”误判的保护。
+
+以下情况会触发在线重新验证或自动重估：
 
 - 摄像头位置或高度改变。
 - 摄像头俯仰角、横滚角改变。
 - RGB分辨率或相机内参改变。
 - 相机支架受到碰撞或松动。
 
-只要相机安装姿态和内参没有变化，就不需要每次启动程序都重新标定。
+只要相机安装姿态和内参没有变化，就不需要每次启动都人工标定。自动重估始终以“画面确实看见足够大且稳定的地面”为前提；长期看不见地面或相机姿态变化超过配置安全范围时，应重新运行`ground_detector.py`，不能强行接受未知平面。
 
 ## 15. 当前豆包视觉AI判断逻辑
 
-`config.yaml`中的`ai.model`必须换成账号已经开通、支持图片理解和Responses API的模型或`ep-...`接入点。本地`FallScore`低于0.50时完全不处理图片；达到0.50时只编码触发时刻这一张干净RGB画面并放入后台线程。默认保留完整场景，最长边限制为768像素，JPEG质量为75，使AI能同时看见人体、地板、床、沙发和椅子。
+`config.yaml`中的`ai.model`必须换成账号已经开通、支持图片理解和Responses API的模型或`ep-...`接入点。只有本地确认FALL或连续强疑似事件才编码图片；普通高H、高V或单帧总分抖动不会单独触发。默认保留完整场景，最长边限制为640像素，JPEG质量为75，使AI能同时看见人体、地板、床、沙发和椅子。
 
 模型只回答`true`、`false`或`uncertain`：
 

@@ -12,10 +12,12 @@ main.py 只负责组织整个程序，不重复各个评分模块内部的计算
 6. pose_3D.py计算P3D，pose_2D.py计算P2D，并融合成姿态分P；
 7. height.py、velocity.py、static.py分别计算H、V、S；
 8. scene.py计算人物场景关系和场景分C；
-9. fall_detector.py对有效维度加权并输出FALL或NO_FALL；
-10. ai_verifier.py在本地疑似时异步调用豆包进行二次复核；
-11. decision_fusion.py融合本地与AI结果，alert_manager.py发布状态变化事件；
-12. 在OpenCV窗口显示识别框、关键点、各维度分数和最终结果。
+9. ground_manager.py持续评估地面质量，相机移动后自动重估；
+10. measurement_guard.py拦截异常Depth和2D/3D姿态冲突；
+11. fall_detector.py对有效维度加权并输出FALL或NO_FALL；
+12. ai_verifier.py在本地确认或多证据强疑似时异步调用豆包复核；
+13. decision_fusion.py融合本地与AI结果，alert_manager.py发布状态变化事件；
+14. 在OpenCV窗口显示识别框、关键点、各维度分数和最终结果。
 
 3D降级原则：
 - 3D正常时使用P3D、H、V、S和C；
@@ -25,14 +27,14 @@ main.py 只负责组织整个程序，不重复各个评分模块内部的计算
 - 已确认FALL后，不会因为Depth突然丢失而自动解除报警。
 
 AI复核原则：
-- 本地FallScore达到0.50时事件触发，不固定每秒上传；
+- 本地确认FALL，或可靠P2D与运动/场景形成强疑似时按事件触发；
 - 每次只上传当前一张经过缩放和JPEG压缩的RGB图片；
 - API在后台线程运行，不阻塞相机采集和本地五维判断；
 - AI成功返回true/false后短时间以AI为主；
 - API密钥缺失、断网、超时或回答无效时立即使用本地结果。
 
 所有可调参数来自config.yaml。
-ground_detector.py是独立地面标定工具，本文件只读取它生成的ground.yaml。
+ground_detector.py仍是初始标定工具；在线地面由ground_manager.py持续验证。
 """
 
 import argparse
@@ -70,6 +72,16 @@ from height import (
     HeightScoreResult,
     HeightScorer,
     run_self_test as height_self_test,
+)
+from ground_manager import (
+    GroundEstimate,
+    GroundManager,
+    run_self_test as ground_self_test,
+)
+from measurement_guard import (
+    MeasurementGuard,
+    MeasurementGuardResult,
+    run_self_test as guard_self_test,
 )
 from pose_2D import (
     Pose2DDetector,
@@ -172,6 +184,8 @@ def load_config(path: str) -> dict:
         "pose_3d",
         "pose_2d",
         "pose_fusion",
+        "ground_manager",
+        "measurement_guard",
         "height_score",
         "velocity_score",
         "static_score",
@@ -214,6 +228,19 @@ def load_config(path: str) -> dict:
 
     if int(config["scene"]["min_mask_area_px"]) <= 0:
         raise ValueError("scene.min_mask_area_px必须大于0")
+
+    ground_weights = config["ground_manager"]["quality_weights"]
+    if abs(sum(float(value) for value in ground_weights.values()) - 1.0) > 1e-6:
+        raise ValueError("ground_manager.quality_weights总和必须等于1")
+    ground_cfg = config["ground_manager"]
+    for name in ("min_quality", "min_inlier_ratio", "min_coverage_ratio"):
+        if not 0.0 <= float(ground_cfg[name]) <= 1.0:
+            raise ValueError(f"ground_manager.{name}必须在0到1之间")
+    if int(ground_cfg["stable_frames"]) <= 0 or int(ground_cfg["ransac_iterations"]) <= 0:
+        raise ValueError("ground_manager稳定帧数和RANSAC次数必须大于0")
+    guard_cfg = config["measurement_guard"]
+    if int(guard_cfg["pose_conflict_confirm_frames"]) <= 0:
+        raise ValueError("measurement_guard.pose_conflict_confirm_frames必须大于0")
 
     mask_alpha = float(config["display"]["scene_mask_alpha"])
     if not 0.0 <= mask_alpha <= 1.0:
@@ -872,6 +899,7 @@ def build_fall_evidence(
     velocity_result: Optional[VelocityScoreResult],
     static_result: Optional[StaticScoreResult],
     scene_result: Optional[SceneRelationResult],
+    depth_usable: Optional[bool] = None,
 ) -> Optional[FallEvidence]:
     """把当前帧各模块结果打包成FallEvidence。
 
@@ -887,7 +915,11 @@ def build_fall_evidence(
     if pose_result is None:
         return None
 
-    depth_reliable = bool(measurement.reliable)
+    depth_reliable = bool(
+        measurement.reliable
+        if depth_usable is None
+        else depth_usable
+    )
 
     # P3D必须同时满足：基础3D可靠、融合结果声明P3D有效、
     # Pose3DDetector返回有效角度。
@@ -985,6 +1017,16 @@ def build_fall_evidence(
         static_valid=static_valid,
         scene_valid=scene_valid,
         pose_3d_valid=pose_3d_valid,
+        height_drop_score=(
+            height_result.drop_score
+            if height_result is not None
+            else 0.0
+        ),
+        height_drop_valid=bool(
+            height_result is not None
+            and height_result.valid
+            and height_result.drop_valid
+        ),
     )
 
 
@@ -1051,9 +1093,12 @@ def build_ai_observation(
     decision: FallDecision,
     pose_3d_result: Pose3DResult,
     pose_2d_result: Optional[Pose2DResult],
+    height_result: Optional[HeightScoreResult],
     velocity_result: Optional[VelocityScoreResult],
     static_result: Optional[StaticScoreResult],
     scene_result: Optional[SceneRelationResult],
+    ground_estimate: Optional[GroundEstimate] = None,
+    guard_result: Optional[MeasurementGuardResult] = None,
     image_jpeg: Optional[bytes] = None,
 ) -> AIFrameObservation:
     """整理触发时刻的本地数据；真正提交时只附加当前一张JPEG。"""
@@ -1093,7 +1138,11 @@ def build_ai_observation(
         data_quality=decision.data_quality,
         angle_2d_deg=angle_2d,
         angle_3d_deg=angle_3d,
-        hip_height_m=measurement.hip_height_m,
+        hip_height_m=(
+            height_result.hip_height_m
+            if height_result is not None and height_result.valid
+            else None
+        ),
         vertical_velocity_mps=vertical_velocity,
         static_duration_s=static_duration,
         scene_relation=(
@@ -1106,6 +1155,35 @@ def build_ai_observation(
             if scene_result is not None
             else 0.0
         ),
+        pose_2d_score=(
+            pose_2d_result.score
+            if pose_2d_result is not None
+            else 0.0
+        ),
+        height_drop_score=(
+            height_result.drop_score
+            if height_result is not None and height_result.drop_valid
+            else 0.0
+        ),
+        height_drop_valid=bool(
+            height_result is not None
+            and height_result.valid
+            and height_result.drop_valid
+        ),
+        ground_state=(
+            ground_estimate.state
+            if ground_estimate is not None
+            else "UNKNOWN"
+        ),
+        ground_quality=(
+            ground_estimate.quality
+            if ground_estimate is not None
+            else 0.0
+        ),
+        pose_conflict=bool(
+            guard_result is not None
+            and guard_result.pose_conflict
+        ),
         image_jpeg=image_jpeg,
     )
 
@@ -1116,6 +1194,8 @@ def log_local_high_risk(
     pose_3d_result: Pose3DResult,
     pose_2d_result: Optional[Pose2DResult],
     config: dict,
+    ground_estimate: Optional[GroundEstimate] = None,
+    guard_result: Optional[MeasurementGuardResult] = None,
 ) -> None:
     """限频记录本地高风险帧，帮助定位是哪一项证据把总分推高。
 
@@ -1165,7 +1245,8 @@ def log_local_high_risk(
         "本地高风险：ID=%s label=%s score=%.2f threshold=%.2f "
         "P=%.2f H=%.2f V=%.2f S=%.2f C=%.2f "
         "Q=%.2f valid=%s weight=%.2f degraded=%s transient=%s "
-        "angle2D=%s angle3D=%s hipH=%s dist=%s issue=%s",
+        "angle2D=%s angle3D=%s hipH=%s dist=%s issue=%s "
+        "ground=%s groundQ=%.2f conflict=%s guard=%s",
         measurement.person_id,
         decision.label,
         decision.fall_score,
@@ -1185,6 +1266,10 @@ def log_local_high_risk(
         hip_height,
         distance,
         measurement.issue,
+        ground_estimate.state if ground_estimate is not None else "UNKNOWN",
+        ground_estimate.quality if ground_estimate is not None else 0.0,
+        bool(guard_result is not None and guard_result.pose_conflict),
+        guard_result.reason if guard_result is not None else "N/A",
     )
 
 
@@ -1298,6 +1383,30 @@ def parse_scene_detections(
         )
 
     return detections
+
+
+def build_ground_exclusion_masks(
+    image_shape: Sequence[int],
+    person_boxes: np.ndarray,
+    scene_detections: Iterable[SceneObjectDetection],
+    margin_ratio: float,
+) -> List[np.ndarray]:
+    """生成在线地面拟合的排除区域，避免把人和家具当作地面。"""
+    height, width = int(image_shape[0]), int(image_shape[1])
+    combined = np.zeros((height, width), dtype=bool)
+    for detection in scene_detections:
+        mask = np.asarray(detection.mask, dtype=bool)
+        if mask.shape == combined.shape:
+            combined |= mask
+    for box in np.asarray(person_boxes, dtype=np.float32).reshape(-1, 4):
+        x1, y1, x2, y2 = map(float, box)
+        box_width, box_height = max(1.0, x2 - x1), max(1.0, y2 - y1)
+        x1 = int(np.clip(x1 - box_width * margin_ratio, 0, width))
+        x2 = int(np.clip(x2 + box_width * margin_ratio, 0, width))
+        y1 = int(np.clip(y1 - box_height * margin_ratio, 0, height))
+        y2 = int(np.clip(y2 + box_height * margin_ratio, 0, height))
+        combined[y1:y2, x1:x2] = True
+    return [combined]
 
 
 # ----------------------------------------------------------------------
@@ -1923,6 +2032,8 @@ def run_live(
         if needs_fall
         else None
     )
+    ground_manager = GroundManager(config, ground_plane)
+    measurement_guard = MeasurementGuard(config)
     ai_coordinator = (
         AIFallCoordinator(config)
         if needs_ai
@@ -1959,6 +2070,7 @@ def run_live(
         """由主线程清除一个Track ID在全部模块里的历史。"""
         person_id = int(person_id)
         pose_3d_detector.reset_person(person_id)
+        measurement_guard.reset_person(person_id)
 
         modules = (
             height_scorer,
@@ -1973,6 +2085,19 @@ def run_live(
         for module in modules:
             if module is not None:
                 module.reset_person(person_id)
+
+    def reset_ground_dependent_histories() -> None:
+        """接受新地面后清除旧坐标系历史，但保留已经确认的FALL状态。"""
+        pose_3d_detector.set_ground_plane(ground_plane, reset_histories=True)
+        if scene_scorer is not None:
+            scene_scorer.set_ground_plane(ground_plane, reset_histories=True)
+        for person_id in list(last_seen_s.keys()):
+            measurement_guard.reset_person(person_id)
+            for module in (height_scorer, velocity_scorer, static_scorer):
+                if module is not None:
+                    module.reset_person(person_id)
+            if fall_detector is not None:
+                fall_detector.invalidate_transient_measurements(person_id)
 
     # HTTP线程只负责收发，真正的重置在下面的相机主循环中执行。
     last_seen_s: Dict[int, float] = {}
@@ -2001,11 +2126,14 @@ def run_live(
         )
         if calibration_issues:
             message = "；".join(calibration_issues)
-            if bool(config["camera"]["strict_ground_calibration"]):
+            if (
+                bool(config["camera"]["strict_ground_calibration"])
+                and not bool(config["ground_manager"]["enabled"])
+            ):
                 raise RuntimeError(
                     f"当前相机与ground.yaml不一致：{message}"
                 )
-            logger.warning("地面标定检查警告：%s", message)
+            logger.warning("地面标定检查警告：%s；在线地面管理器将重新验证", message)
 
         align_filter = AlignFilter(
             align_to_stream=OBStreamType.COLOR_STREAM
@@ -2014,6 +2142,8 @@ def run_live(
         # 家具变化较慢，因此Seg不是每帧运行，帧间复用最近一次结果。
         scene_detections: List[SceneObjectDetection] = []
         frame_index = 0
+        ground_estimate = ground_manager.current_estimate(time.monotonic())
+        last_ground_state = ground_estimate.state
 
         window_name = str(
             config["display"]["window_names"][stage]
@@ -2134,6 +2264,50 @@ def run_live(
             )
             now = time.monotonic()
 
+            # 在线地面拟合必须排除本帧人体和最近家具Mask，避免把人、床或沙发
+            # 误当成大平面。即使没有检测到人，也继续检查地面质量。
+            ground_boxes = np.empty((0, 4), dtype=np.float32)
+            if pose_results:
+                first_pose_result = pose_results[0]
+                if first_pose_result.boxes is not None:
+                    ground_boxes = first_pose_result.boxes.xyxy.cpu().numpy()
+            exclusion_masks = build_ground_exclusion_masks(
+                image.shape[:2],
+                ground_boxes,
+                scene_detections,
+                float(config["ground_manager"]["person_box_margin_ratio"]),
+            )
+            ground_estimate = ground_manager.update(
+                frame_index,
+                now,
+                depth_m,
+                intrinsics,
+                exclusion_masks,
+            )
+            if ground_estimate.plane is not None and ground_estimate.usable:
+                ground_plane = ground_estimate.plane
+                pose_3d_detector.set_ground_plane(ground_plane)
+                if scene_scorer is not None:
+                    scene_scorer.set_ground_plane(ground_plane)
+            if ground_estimate.changed:
+                reset_ground_dependent_histories()
+                logger.warning(
+                    "在线地面已更新：quality=%.2f inliers=%.2f rmse=%.3fm coverage=%.2f",
+                    ground_estimate.quality,
+                    ground_estimate.inlier_ratio,
+                    ground_estimate.rmse_m,
+                    ground_estimate.coverage_ratio,
+                )
+            if ground_estimate.state != last_ground_state:
+                logger.info(
+                    "地面状态：%s -> %s，quality=%.2f，reason=%s",
+                    last_ground_state,
+                    ground_estimate.state,
+                    ground_estimate.quality,
+                    ground_estimate.reason,
+                )
+                last_ground_state = ground_estimate.state
+
             # 只检查已经完成的后台任务，不等待网络，因此不会降低相机帧率。
             if ai_coordinator is not None:
                 ai_coordinator.poll(now)
@@ -2200,14 +2374,16 @@ def run_live(
                             config=config,
                         )
 
-                        # 3D不可靠时使用全NaN，防止错误Depth污染P3D历史。
-                        if measurement.reliable:
-                            depth_points = measurement.keypoints_3d
-                        else:
-                            depth_points = np.full_like(
-                                measurement.keypoints_3d,
-                                np.nan,
-                            )
+                        # 地面未通过在线质量检查时，P3D先停用；P2D不受影响。
+                        base_depth_usable = bool(
+                            measurement.reliable
+                            and ground_estimate.usable
+                        )
+                        depth_points = (
+                            measurement.keypoints_3d
+                            if base_depth_usable
+                            else np.full_like(measurement.keypoints_3d, np.nan)
+                        )
 
                         pose_3d_result = pose_3d_detector.update(
                             person_id,
@@ -2231,6 +2407,50 @@ def run_live(
                             else None
                         )
 
+                        # 统一比较2D/3D姿态并检查人体3D几何。持续冲突时整条
+                        # 3D证据链降级，防止错误P3D、H和V共同制造高分。
+                        guard_result = measurement_guard.update(
+                            person_id,
+                            measurement.keypoints_3d,
+                            (
+                                pose_2d_result.image_angle_deg
+                                if pose_2d_result is not None
+                                and pose_2d_result.valid_angle
+                                else None
+                            ),
+                            body_angle_3d,
+                            measurement.reliable,
+                            ground_estimate.usable,
+                        )
+                        if not guard_result.depth_valid:
+                            depth_points = np.full_like(
+                                measurement.keypoints_3d,
+                                np.nan,
+                            )
+                            if pose_3d_result.valid:
+                                pose_3d_detector.reset_person(person_id)
+                                pose_3d_result = pose_3d_detector.update(
+                                    person_id,
+                                    depth_points,
+                                    measurement.keypoint_conf,
+                                )
+                                body_angle_3d = None
+                        if (
+                            guard_result.pose_conflict
+                            and guard_result.conflict_frames
+                            == int(config["measurement_guard"]["pose_conflict_confirm_frames"])
+                        ):
+                            for module in (height_scorer, velocity_scorer, static_scorer):
+                                if module is not None:
+                                    module.reset_person(person_id)
+                            if fall_detector is not None:
+                                fall_detector.invalidate_transient_measurements(person_id)
+                            logger.warning(
+                                "2D/3D姿态冲突，已禁用当前3D链路：ID=%d disagreement=%.1fdeg",
+                                person_id,
+                                guard_result.angle_disagreement_deg or 0.0,
+                            )
+
                         # P3D缺失时，fuse_pose_dimension会移除P3D权重，
                         # 此时姿态维度P等于有效的P2D。
                         pose_score_result = (
@@ -2247,11 +2467,15 @@ def run_live(
                             else None
                         )
 
-                        # H和V依赖髋高。3D不可靠时传None，
-                        # 对应模块会返回valid=False且不写入错误历史。
+                        # 地面刚切换后的预热期也不更新H/V/S历史。
+                        temporal_3d_usable = bool(
+                            guard_result.depth_valid
+                            and ground_estimate.usable
+                            and not ground_estimate.warmup_active
+                        )
                         hip_height_input = (
                             measurement.hip_height_m
-                            if measurement.reliable
+                            if temporal_3d_usable
                             else None
                         )
                         height_result = (
@@ -2259,6 +2483,8 @@ def run_live(
                                 person_id,
                                 now,
                                 hip_height_input,
+                                ground_valid=ground_estimate.usable,
+                                measurement_valid=temporal_3d_usable,
                             )
                             if height_scorer is not None
                             else None
@@ -2267,13 +2493,19 @@ def run_live(
                             velocity_scorer.update(
                                 person_id,
                                 now,
-                                hip_height_input,
+                                (
+                                    height_result.hip_height_m
+                                    if height_result is not None
+                                    and height_result.valid
+                                    else None
+                                ),
                             )
                             if velocity_scorer is not None
                             else None
                         )
 
-                        # scene.py在3D缺失时通常返回unknown和中性场景分。
+                        # 场景中的地面高度也依赖可靠地面；无效时不把unknown
+                        # 当成有效中性分，而是让C维度暂时退出加权。
                         scene_result = (
                             scene_scorer.analyze(
                                 person_id,
@@ -2285,6 +2517,8 @@ def run_live(
                                 intrinsics,
                             )
                             if scene_scorer is not None
+                            and guard_result.depth_valid
+                            and ground_estimate.usable
                             else None
                         )
 
@@ -2298,7 +2532,7 @@ def run_live(
                         ):
                             torso_center_input = (
                                 measurement.torso_center_3d
-                                if measurement.reliable
+                                if temporal_3d_usable
                                 else None
                             )
                             height_score_input = (
@@ -2326,6 +2560,7 @@ def run_live(
                             velocity_result,
                             static_result,
                             scene_result,
+                            depth_usable=guard_result.depth_valid,
                         )
 
                         decision = None
@@ -2343,13 +2578,15 @@ def run_live(
                                 pose_3d_result,
                                 pose_2d_result,
                                 config,
+                                ground_estimate,
+                                guard_result,
                             )
 
                         ai_status = None
                         fusion_decision = None
                         if decision is not None and ai_coordinator is not None:
-                            # 先构造不含图片的轻量观测。只有本地FallScore达到
-                            # 0.50且冷却、网络、队列均允许时，协调器才调用
+                            # 先构造不含图片的轻量观测。只有本地确认FALL或
+                            # 多证据强疑似且网络、队列均允许时，协调器才调用
                             # image_provider编码这一张图片，正常帧不会浪费CPU。
                             ai_observation = build_ai_observation(
                                 measurement,
@@ -2357,9 +2594,12 @@ def run_live(
                                 decision,
                                 pose_3d_result,
                                 pose_2d_result,
+                                height_result,
                                 velocity_result,
                                 static_result,
                                 scene_result,
+                                ground_estimate=ground_estimate,
+                                guard_result=guard_result,
                                 image_jpeg=None,
                             )
                             ai_coordinator.observe(
@@ -2440,6 +2680,21 @@ def run_live(
                 (0, 255, 255),
                 2,
             )
+            if bool(config["display"].get("show_ground_status", True)):
+                ground_color = (
+                    (0, 255, 0)
+                    if ground_estimate.usable
+                    else (0, 215, 255)
+                )
+                cv2.putText(
+                    image,
+                    f"GROUND: {ground_estimate.state} Q={ground_estimate.quality:.2f}",
+                    (12, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    ground_color,
+                    2,
+                )
 
             if bool(config["display"]["enabled"]):
                 cv2.imshow(window_name, image)
@@ -2467,6 +2722,8 @@ def run_live(
 
 def run_self_test(config: dict) -> None:
     """运行所有模块测试，并验证Depth缺失时仍能生成跌倒证据。"""
+    ground_self_test(config)
+    guard_self_test(config)
     pose_3d_self_test(config)
     pose_2d_self_test(config)
     height_self_test(config)

@@ -18,7 +18,6 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
-import logging
 import os
 from pathlib import Path
 import re
@@ -28,12 +27,9 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import yaml
 
-from logging_utils import configure_logging
-
 AI_FALL = "FALL"
 AI_NO_FALL = "NO_FALL"
 AI_UNCERTAIN = "UNCERTAIN"
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -384,20 +380,23 @@ class ArkResponsesClient:
             payload = self.build_payload(request)
             if self.debug_enabled:
                 image_size_kb = len(observation.image_jpeg or b"") / 1024.0
-                logger.info(
-                    "AI请求开始：ID=%d event=%s local=%.2f jpeg=%.1fKB model=%s",
-                    request.person_id, request.event_id,
-                    observation.local_fall_score, image_size_kb, self.model,
+                print(
+                    "[AI DEBUG] API请求开始："
+                    f"ID={request.person_id} event={request.event_id} "
+                    f"local={observation.local_fall_score:.2f} "
+                    f"jpeg={image_size_kb:.1f}KB model={self.model}"
                 )
             response = self._request_api(payload)
             raw_answer = self._extract_answer_text(response)
             verdict, confidence, reason, observations = self._parse_answer(raw_answer)
             completed_s = time.monotonic()
             if self.debug_enabled:
-                logger.info(
-                    "AI请求完成：ID=%d verdict=%s confidence=%.2f latency=%.2fs answer=%r",
-                    request.person_id, verdict, confidence,
-                    completed_s - started_s, raw_answer,
+                print(
+                    "[AI DEBUG] API请求完成："
+                    f"ID={request.person_id} verdict={verdict} "
+                    f"confidence={confidence:.2f} "
+                    f"latency={completed_s - started_s:.2f}s "
+                    f"answer={raw_answer!r}"
                 )
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -421,10 +420,10 @@ class ArkResponsesClient:
         except Exception as error:
             completed_s = time.monotonic()
             if self.debug_enabled:
-                logger.warning(
-                    "AI请求失败，改用本地判断：ID=%d latency=%.2fs error=%s: %s",
-                    request.person_id, completed_s - started_s,
-                    type(error).__name__, error,
+                print(
+                    "[AI DEBUG] API请求失败，改用本地判断："
+                    f"ID={request.person_id} latency={completed_s - started_s:.2f}s "
+                    f"error={type(error).__name__}: {error}"
                 )
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -547,33 +546,11 @@ class AIFallCoordinator:
         return bool(self.verifier.client.supports_vision)
 
     def _risk_triggered(self, observation: AIFrameObservation) -> bool:
-        """判断当前帧是否达到AI复核条件。
-
-        FallScore只是风险分，不是跌倒概率。默认要求本地状态机已经确认FALL，
-        同时检查总分、姿态分和数据质量，避免单帧Depth抖动或缺失维度触发AI。
-        """
-        trigger_cfg = self.cfg["trigger"]
-
-        # 稳定模式：本地状态机没有确认FALL时，不向AI上传图片。
-        require_local_fall = bool(trigger_cfg.get("require_local_fall", True))
-        if require_local_fall and observation.local_label != "FALL":
-            return False
-
-        # 总风险分必须达到阈值。
-        if observation.local_fall_score < float(trigger_cfg["fall_score"]):
-            return False
-
-        # 姿态必须具有明显异常，避免单独由场景或Depth误差触发。
-        if observation.pose_score < float(trigger_cfg.get("min_pose_score", 0.50)):
-            return False
-
-        # 图像或RGB-D数据质量太低时不上传，避免AI分析错误截图。
-        if observation.data_quality < float(
-            trigger_cfg.get("min_data_quality", 0.50)
-        ):
-            return False
-
-        return True
+        """本地FallScore达到阈值就认为值得上传，不再强制其他维度。"""
+        return bool(
+            observation.local_fall_score
+            >= float(self.cfg["trigger"]["fall_score"])
+        )
 
     def _request_allowed(self, observation: AIFrameObservation) -> bool:
         """检查密钥、视觉能力、连续帧、冷却、队列和网络退避。"""
@@ -633,16 +610,17 @@ class AIFallCoordinator:
         )
         if not self.verifier.submit(verification_request):
             if self.debug_enabled:
-                logger.warning("AI请求队列已满，本次跳过：ID=%d", person_id)
+                print(f"[AI DEBUG] 请求队列已满，本次跳过：ID={person_id}")
             return False
 
         self.pending_people[person_id] = event_id
         self.last_submit_s[person_id] = now
         self.consecutive_risk[person_id] = 0
         if self.debug_enabled:
-            logger.info(
-                "AI单图请求已提交：ID=%d event=%s FallScore=%.2f",
-                person_id, event_id, observation.local_fall_score,
+            print(
+                "[AI DEBUG] 单图请求已提交后台线程："
+                f"ID={person_id} event={event_id} "
+                f"FallScore={observation.local_fall_score:.2f}"
             )
         return True
 
@@ -672,9 +650,9 @@ class AIFallCoordinator:
                 )
                 self.backoff_until_s = now + delay
                 if self.debug_enabled:
-                    logger.warning(
-                        "AI进入网络退避：连续失败=%d，暂停=%.1fs",
-                        self.failure_count, delay,
+                    print(
+                        "[AI DEBUG] 进入网络退避："
+                        f"连续失败={self.failure_count}，暂停={delay:.1f}s"
                     )
         return accepted_results
 
@@ -995,7 +973,6 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = load_config(args.config)
-    configure_logging(config, Path(__file__).resolve().parent)
     if args.self_test:
         run_self_test(config)
     elif args.api_test:

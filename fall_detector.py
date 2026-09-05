@@ -79,6 +79,10 @@ class FallEvidence:
     # 单独记录P中是否包含有效P3D，用于选择普通或2D降级规则。
     pose_3d_valid: bool = True
 
+    # v0.95把H中的“真实历史下降”单独传入；绝对低高度不能再锁存瞬态。
+    height_drop_score: float = 0.0
+    height_drop_valid: bool = False
+
 
 @dataclass
 class FallDecision:
@@ -115,7 +119,7 @@ class _PersonMemory:
     recover_since: Optional[float] = None
     recover_mode: Optional[str] = None
 
-    # H或V出现瞬态高分后，将证据保留到这个时间。
+    # 真实高度下降分或V出现瞬态高分后，将证据保留到这个时间。
     transient_evidence_until: float = 0.0
 
     # 对外二值状态。
@@ -214,6 +218,7 @@ class FallDetector:
         memory: _PersonMemory,
         scores: Dict[str, float],
         validity: Dict[str, bool],
+        evidence: FallEvidence,
         now: float,
     ) -> bool:
         """保存短暂出现的高度下降或快速下降证据。
@@ -223,12 +228,15 @@ class FallDetector:
         2. 髋部高度降低，此时H升高；
         3. 人体最终水平并保持静止，此时P和S升高。
 
-        H和V的高分可能只持续很短。如果不保存瞬态证据，等到P、S升高时，
-        H或V可能已经降低，导致几个证据无法在同一帧组合。
+        真实下降分和V可能只持续很短。如果不保存瞬态证据，等到P、S升高时，
+        下降或速度可能已经降低，导致几个证据无法在同一帧组合。
         """
+        # 这里必须使用height.py单独输出的drop_score，不能使用聚合后的H。
+        # 因此“当前髋高很低”只能作为当前高度证据，不会伪装成刚刚跌落。
         height_triggered = (
-            validity["height"]
-            and scores["height"]
+            bool(evidence.height_drop_valid)
+            and np.isfinite(evidence.height_drop_score)
+            and float(evidence.height_drop_score)
             >= float(self.state_cfg["transient_height_score"])
         )
         velocity_triggered = (
@@ -529,6 +537,7 @@ class FallDetector:
             memory,
             scores,
             validity,
+            evidence,
             now,
         )
         fall_score, available_weight = self._calculate_fall_score(
@@ -555,6 +564,8 @@ class FallDetector:
             static_valid=validity["static"],
             scene_valid=validity["scene"],
             pose_3d_valid=bool(evidence.pose_3d_valid),
+            height_drop_score=self._bounded(evidence.height_drop_score),
+            height_drop_valid=bool(evidence.height_drop_valid),
         )
 
         self._update_binary_state(
@@ -613,10 +624,39 @@ class FallDetector:
         """立即清除指定人员的评分历史和状态。"""
         self.people.pop(int(person_id), None)
 
+    def invalidate_transient_measurements(self, person_id: int) -> None:
+        """地面切换后清除候选与瞬态计时，但保留已经确认的FALL状态。"""
+        memory = self.people.get(int(person_id))
+        if memory is None:
+            return
+        memory.candidate_since = None
+        memory.candidate_mode = None
+        memory.transient_evidence_until = 0.0
+        memory.score_history.clear()
+
 
 def run_self_test(config: dict) -> None:
     """验证完整五维、2D降级、报警恢复和床上躺卧抑制。"""
     detector = FallDetector(config)
+
+    # H=1可能只表示当前位置低；没有真实历史下降时不能锁存瞬态证据。
+    absolute_only = detector.update(
+        FallEvidence(
+            person_id=90,
+            timestamp_s=0.0,
+            pose_score=0.2,
+            height_score=1.0,
+            velocity_score=0.0,
+            static_score=0.0,
+            scene_score=0.5,
+            body_angle_3d_deg=20.0,
+            hip_height_m=0.20,
+            data_quality=0.95,
+            height_drop_score=0.0,
+            height_drop_valid=False,
+        )
+    )
+    assert not absolute_only.transient_evidence_active
 
     def feed_full_evidence(
         person_id: int,
@@ -764,7 +804,7 @@ def run_self_test(config: dict) -> None:
 
     print("fall_detector self-test: PASS")
     print(
-        "  full five-score path, missing-3D fallback, "
+        "  drop-only transient, full five-score path, missing-3D fallback, "
         "recovery, bed suppression=PASS"
     )
 
