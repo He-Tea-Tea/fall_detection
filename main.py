@@ -1681,6 +1681,11 @@ def draw_person(
             f"source={fusion_decision.source}"
         )
 
+    # show_debug_text控制人体框下方的白色详细参数。
+    # 关闭后仍保留人体框、顶部FALL/NO_FALL状态和其他可视化内容。
+    if not bool(config["display"].get("show_debug_text", True)):
+        return
+
     line_height = int(config["display"]["line_height_px"])
     text_y = min(
         image.shape[0] - 8,
