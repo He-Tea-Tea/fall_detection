@@ -187,7 +187,7 @@ ai:                                         # ai_verifier.py：本地疑似后�
   provider: volcengine_ark                  # 服务提供方标识，后续更换AI厂商时用于选择适配器
   base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟OpenAI兼容API根地址
   api_key_env: ARK_API_KEY                  # 推荐使用的环境变量名
-  api_key: ""                              # 建议留空，通过ARK_API_KEY环境变量读取，避免密钥泄露
+  api_key: "ark-39c88c0a-d31c-4496-a1e9-a5900df16eab-34585"    # 建议留空，通过ARK_API_KEY环境变量读取，避免密钥泄露
   model: doubao-seed-evolving               # 模型或ep接入点ID；必须先在方舟控制台开通视觉能力
   supports_vision: true                     # 本流程必须为true，因为每次请求都会上传一张图片
   request:                                  # Responses API与后台线程参数
@@ -209,8 +209,8 @@ ai:                                         # ai_verifier.py：本地疑似后�
       发现至少一人明显跌倒在地面回答 true；明确没有跌倒回答 false。
       只能输出 true、false 或 uncertain，不要解释，不要添加标点。
   trigger:                                  # 本地结果何时触发一次单图上传
-    fall_score: 0.50                        # 本地FallScore达到0.50时触发AI复核
-    consecutive_frames: 1                   # 1表示达到阈值立即提交，调大可减少瞬时误触发
+    fall_score: 0.60                        # 本地FallScore达到0.60时触发AI复核
+    consecutive_frames: 3                   # 3表示需要连续3帧满足条件才提交，过滤单帧抖动
     cooldown_s: 5.0                         # 同一人持续疑似时最短复查间隔，单位秒
     fall_recheck_s: 10.0                    # 本地已经FALL时的最短AI复查间隔，单位秒
     result_ttl_s: 20.0                      # 最新明确AI结果可被融合层读取的最长时间
@@ -280,3 +280,10 @@ display:                                    # OpenCV可视化
   scene_mask_alpha: 0.35                    # 家具Mask透明度
   font_scale: 0.50                          # 主标签字体大小
   line_height_px: 18                        # 数据文字行距，单位像素
+
+#--------------------------------------audio-------------------------------------#
+audio:
+  enabled: true                          # 是否启用最终状态提示音
+  fall_file: audio/Are you ok.wav        # 最终状态变成FALL时播放
+  recovery_file: audio/care.wav          # 最终状态恢复NO_FALL时播放
+  play_recovery: true                    # 是否播放恢复提示音

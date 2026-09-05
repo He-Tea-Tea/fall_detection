@@ -547,11 +547,33 @@ class AIFallCoordinator:
         return bool(self.verifier.client.supports_vision)
 
     def _risk_triggered(self, observation: AIFrameObservation) -> bool:
-        """本地FallScore达到阈值就认为值得上传，不再强制其他维度。"""
-        return bool(
-            observation.local_fall_score
-            >= float(self.cfg["trigger"]["fall_score"])
-        )
+        """判断当前帧是否达到AI复核条件。
+
+        FallScore只是风险分，不是跌倒概率。默认要求本地状态机已经确认FALL，
+        同时检查总分、姿态分和数据质量，避免单帧Depth抖动或缺失维度触发AI。
+        """
+        trigger_cfg = self.cfg["trigger"]
+
+        # 稳定模式：本地状态机没有确认FALL时，不向AI上传图片。
+        require_local_fall = bool(trigger_cfg.get("require_local_fall", True))
+        if require_local_fall and observation.local_label != "FALL":
+            return False
+
+        # 总风险分必须达到阈值。
+        if observation.local_fall_score < float(trigger_cfg["fall_score"]):
+            return False
+
+        # 姿态必须具有明显异常，避免单独由场景或Depth误差触发。
+        if observation.pose_score < float(trigger_cfg.get("min_pose_score", 0.50)):
+            return False
+
+        # 图像或RGB-D数据质量太低时不上传，避免AI分析错误截图。
+        if observation.data_quality < float(
+            trigger_cfg.get("min_data_quality", 0.50)
+        ):
+            return False
+
+        return True
 
     def _request_allowed(self, observation: AIFrameObservation) -> bool:
         """检查密钥、视觉能力、连续帧、冷却、队列和网络退避。"""

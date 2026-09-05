@@ -103,6 +103,7 @@ from velocity import (
 
 from http_bridge import HttpBridge
 from logging_utils import configure_logging, log_rate_limiter
+from audio_alert import AudioAlertPlayer
 
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
@@ -1109,6 +1110,84 @@ def build_ai_observation(
     )
 
 
+def log_local_high_risk(
+    measurement: PersonMeasurement,
+    decision: FallDecision,
+    pose_3d_result: Pose3DResult,
+    pose_2d_result: Optional[Pose2DResult],
+    config: dict,
+) -> None:
+    """限频记录本地高风险帧，帮助定位是哪一项证据把总分推高。
+
+    本函数只输出诊断日志，不修改五维分数、不触发AI，也不改变最终状态。
+    当FallScore达到ai.trigger.fall_score后，按人员ID分别限频记录一次。
+    """
+    trigger_score = float(config["ai"]["trigger"]["fall_score"])
+    if decision.fall_score < trigger_score:
+        return
+
+    # 默认每2秒最多记录一次；可在logging.local_risk_interval_s中调整。
+    interval_s = float(
+        config.get("logging", {}).get("local_risk_interval_s", 2.0)
+    )
+    if not log_rate_limiter.allow(
+        f"local_high_risk_{measurement.person_id}",
+        interval_s,
+    ):
+        return
+
+    angle_3d = (
+        f"{pose_3d_result.filtered_angle_deg:.1f}"
+        if pose_3d_result.valid
+        and pose_3d_result.filtered_angle_deg is not None
+        else "N/A"
+    )
+    angle_2d = (
+        f"{pose_2d_result.image_angle_deg:.1f}"
+        if pose_2d_result is not None
+        and pose_2d_result.valid_angle
+        and pose_2d_result.image_angle_deg is not None
+        else "N/A"
+    )
+    hip_height = (
+        f"{measurement.hip_height_m:.3f}"
+        if measurement.hip_height_m is not None
+        else "N/A"
+    )
+    distance = (
+        f"{measurement.distance_m:.2f}"
+        if measurement.distance_m is not None
+        else "N/A"
+    )
+    valid_dimensions = ",".join(decision.valid_dimensions) or "NONE"
+
+    logger.info(
+        "本地高风险：ID=%s label=%s score=%.2f threshold=%.2f "
+        "P=%.2f H=%.2f V=%.2f S=%.2f C=%.2f "
+        "Q=%.2f valid=%s weight=%.2f degraded=%s transient=%s "
+        "angle2D=%s angle3D=%s hipH=%s dist=%s issue=%s",
+        measurement.person_id,
+        decision.label,
+        decision.fall_score,
+        trigger_score,
+        decision.pose_score,
+        decision.height_score,
+        decision.velocity_score,
+        decision.static_score,
+        decision.scene_score,
+        decision.data_quality,
+        valid_dimensions,
+        decision.available_weight,
+        decision.degraded_mode,
+        decision.transient_evidence_active,
+        angle_2d,
+        angle_3d,
+        hip_height,
+        distance,
+        measurement.issue,
+    )
+
+
 # ----------------------------------------------------------------------
 # YOLO Seg结果转换
 # ----------------------------------------------------------------------
@@ -1854,6 +1933,11 @@ def run_live(
         if needs_ai
         else None
     )
+    # 音频处理器只监听最终融合状态变化，不监听每一次AI原始回答。
+    audio_player = AudioAlertPlayer(config, BASE_DIR)
+
+    if alert_manager is not None:
+        alert_manager.register_handler(audio_player.handle_event)
 
     if (
         ai_coordinator is not None
@@ -2245,6 +2329,16 @@ def run_live(
                             and evidence is not None
                         ):
                             decision = fall_detector.update(evidence)
+
+                            # 只在本地总分达到AI观察阈值时记录详细证据。
+                            # 日志用于排查误触发，不会直接提交AI或修改状态机。
+                            log_local_high_risk(
+                                measurement,
+                                decision,
+                                pose_3d_result,
+                                pose_2d_result,
+                                config,
+                            )
 
                         ai_status = None
                         fusion_decision = None

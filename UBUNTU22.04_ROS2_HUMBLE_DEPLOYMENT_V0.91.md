@@ -477,22 +477,37 @@ python3 -m pip freeze --user > requirements-v0.91-ubuntu.lock.txt
 source /opt/ros/humble/setup.bash
 
 python3 - <<'PY'
-import cv2
-import numpy
-import openai
-import torch
-import ultralytics
-import yaml
-from pyorbbecsdk import Pipeline, AlignFilter, OBStreamType
+import importlib
 
-print("numpy:", numpy.__version__)
-print("opencv:", cv2.__version__)
-print("torch:", torch.__version__)
-print("cuda available:", torch.cuda.is_available())
-print("ultralytics:", ultralytics.__version__)
-print("openai:", openai.__version__)
-print("pyorbbecsdk import: PASS")
-print("all imports: PASS")
+modules = [
+    "cv2",
+    "numpy",
+    "openai",
+    "torch",
+    "ultralytics",
+    "yaml",
+    "pyorbbecsdk",
+]
+
+for name in modules:
+    try:
+        module = importlib.import_module(name)
+        version = getattr(module, "__version__", "未提供版本号")
+        print(f"[PASS] {name}: {version}")
+    except Exception as error:
+        print(f"[FAIL] {name}: {error}")
+
+try:
+    from pyorbbecsdk import Pipeline, AlignFilter, OBStreamType
+    print("[PASS] pyorbbecsdk核心类导入成功")
+except Exception as error:
+    print(f"[FAIL] pyorbbecsdk核心类导入失败: {error}")
+
+try:
+    import torch
+    print("[INFO] CUDA available:", torch.cuda.is_available())
+except Exception:
+    pass
 PY
 ```
 
