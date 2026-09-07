@@ -1,0 +1,45 @@
+v0.96版本更新说明
+
+1. 基于v0.95.1源代码完成目录重构
+(1) 以C:\Users\和茶茶\Downloads\v0.95.1为唯一源版本。
+(2) 新增fall_detection/app，用于应用入口、命令行和主流程编排。
+(3) 新增fall_detection/domain，用于本地跌倒业务决策、五维融合和状态机。
+(4) 新增fall_detection/features，用于高度、速度和静止等时序特征计算。
+(5) 新增fall_detection/perception，用于2D/3D姿态、场景、地面和测量保护。
+(6) 新增fall_detection/integrations，用于视觉AI、HTTP和告警接口适配。
+(7) 新增fall_detection/infrastructure，用于日志和音频等通用运行服务。
+(8) 新增fall_detection/tools，用于地面标定、内参读取、模型导出、AI测试和结果接收。
+
+2. 保留根目录启动方式并增加标准模块启动方式
+(1) 保留v0.96/main.py作为兼容启动入口。
+(2) 支持python main.py --self-test --config config.yaml。
+(3) 支持python -m fall_detection.app.main --self-test --config config.yaml。
+(4) 业务代码统一放入fall_detection包，避免根目录堆放大量实现文件。
+
+3. 修正重构后的包内导入关系
+(1) 将原有绝对导入改为包内相对导入。
+(2) 修正各模块默认配置文件路径，统一指向v0.96/config.yaml。
+(3) 保留各模块的自测和兼容接口，避免算法逻辑因目录调整被改变。
+
+4. 统一模型、标定、图片和运行文件位置
+(1) YOLO模型统一放入assets/models。
+(2) 地面标定文件ground.yaml统一放入assets/calibration。
+(3) 离线测试图片、回放图片和人工验收图片放入assets/images。
+(4) 运行日志放入v0.96/Log，首次运行时自动创建。
+(5) AI调试图片按配置写入v0.96/debug_ai，不放入源码目录。
+(6) 交付代码包不包含模型、图片、日志和真实API Key。
+
+5. 更新配置中的资产路径
+(1) paths.ground_file改为assets/calibration/ground.yaml。
+(2) models.pose_model改为assets/models/yolo26s-pose.pt。
+(3) models.scene_model改为assets/models/yolo26s-seg.pt。
+(4) 如果使用onnx模型，只需替换assets/models中的文件并同步修改config.yaml。
+
+6. 增加标准项目元文件和使用说明
+(1) 新增pyproject.toml，声明Python包和最低Python版本。
+(2) 新增README.txt，说明启动命令和外部文件放置位置。
+(3) 新增docs/V0.96_STRUCTURE.txt，说明目录和文件职责。
+(4) 新增v0.96目录专用.gitignore，忽略模型、图片、日志和调试文件。
+(5) 新增tests目录和基于Python unittest的标准smoke测试入口。
+
+

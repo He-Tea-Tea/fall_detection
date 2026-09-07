@@ -2,10 +2,10 @@
 # 跌倒检测系统统一配置：所有可调参数集中在这里
 # ============================================================
 paths:                                      # 外部文件路径
-  ground_file: ground.yaml                  # 地面标定结果；相对路径以config.yaml目录为基准
+  ground_file: assets/calibration/ground.yaml # 地面标定结果；相对路径以config.yaml目录为基准
 models:                                     # YOLO模型与推理参数
-  pose_model: yolo26s-pose.pt               # 可换为同模型导出的.onnx；输出必须包含Pose关键点
-  scene_model: yolo26s-seg.pt               # 可换为同模型导出的.onnx；输出必须包含实例Mask
+  pose_model: assets/models/yolo26s-pose.onnx  # 可换为assets/models下同模型导出的.onnx
+  scene_model: assets/models/yolo26s-seg.onnx  # 可换为assets/models下同模型导出的.onnx
   pose_conf: 0.45                           # 人体检测最低置信度，调低减少漏检但增加误检
   scene_conf: 0.35                          # 家具检测最低置信度，调低更容易检测遮挡家具
   scene_retina_masks: true                  # 是否输出精细Mask；true边缘更准但稍占显存

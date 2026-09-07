@@ -1,29 +1,10 @@
-Log/
-
-# Python缓存
 __pycache__/
 *.py[cod]
-
-# 环境与密钥
 .env
 .env.*
 *.key
-
-# AI调试图片
+Log/
 debug_ai/
-
-# IDE
-.vscode/
-.idea/
-
-# 日志
-*.log
-
-# 模型权重
-*.pt
-*.onnx
-*.engine
-
-# 临时文件
-*.tmp
+assets/images/*
+assets/models/*
 *.log

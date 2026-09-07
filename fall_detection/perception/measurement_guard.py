@@ -15,7 +15,7 @@ from typing import Dict, Optional
 import numpy as np
 import yaml
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP = 5, 6, 11, 12
 
 
@@ -139,7 +139,7 @@ def main() -> None:
     if args.self_test:
         run_self_test(config)
     else:
-        from main import run_live
+        from ..app.main import run_live
         run_live(config, args.config, stage="full")
 
 

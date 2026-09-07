@@ -41,7 +41,7 @@ from typing import Deque, Dict, Optional, Tuple
 import numpy as np
 import yaml
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -498,7 +498,7 @@ def main() -> None:
     else:
         # 相机采集、3D反投影和可视化由main.py统一负责。
         # 本文件只接收躯干3D中心、姿态分P和高度分H。
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(
             config,

@@ -1,0 +1,39 @@
+v0.96 目录说明
+
+这是代码包的标准分层目录。模型、标定文件、运行日志和调试图片不混入 Python 源码目录。
+
+fall_detection/app
+应用入口和运行编排。main.py 负责启动配置、相机、模型、逐帧流水线和资源关闭，不承载单个评分公式。
+
+fall_detection/domain
+跌倒业务核心。fall_detector.py 负责 P/H/V/S/C 加权和 FALL/NO_FALL 状态机；decision_fusion.py 负责本地、AI 和外部确认优先级。
+
+fall_detection/features
+时序特征评分。height.py、velocity.py、static.py 分别计算高度、下降速度和异常后静止分数。
+
+fall_detection/perception
+感知和几何测量。pose_2d.py、pose_3d.py、scene.py、ground_manager.py、measurement_guard.py 负责姿态、场景、地面质量和测量保护。
+
+fall_detection/integrations
+外部系统适配。ai_verifier.py 对接视觉 AI；http_bridge.py 发送最终结果并接收 reset；alert_manager.py 发布状态变化事件。
+
+fall_detection/infrastructure
+通用运行服务。logging_utils.py 负责日志；audio_alert.py 负责音频提示。
+
+fall_detection/tools
+离线或辅助工具。ground_detector.py 首次地面标定；get_intrinsics.py 读取内参；export_onnx.py 导出模型；ai_test.py 单独测试 AI；receiver.py 接收 HTTP 结果。
+
+tests
+标准测试入口。当前test_smoke.py调用完整无硬件自测；后续将各算法模块的合成测试逐步迁移到这里。
+
+assets/models
+放置 YOLO 模型权重，例如 yolo26s-pose.pt、yolo26s-seg.pt。也可以放对应的 .onnx 文件，但必须同步修改根目录 config.yaml。
+
+assets/calibration
+放置 ground.yaml。它是当前相机、RGB 分辨率、Depth 对齐坐标和地面平面的标定文件。
+
+assets/images
+放置离线测试图片、回放图片或人工验收图片。正式运行时不要求该目录有文件。
+
+运行生成目录
+Log 放在 v0.96 根目录下；AI 调试图片按 config.yaml 的 ai.debug.save_directory 写入根目录下的 debug_ai。两者均不属于代码包。

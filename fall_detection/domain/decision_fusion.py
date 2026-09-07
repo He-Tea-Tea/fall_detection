@@ -18,12 +18,12 @@ from typing import Dict, Optional
 
 import yaml
 
-from ai_verifier import (
+from ..integrations.ai_verifier import (
     AI_FALL,
     AI_NO_FALL,
     AIVerificationResult,
 )
-from fall_detector import FallDecision
+from .fall_detector import FallDecision
 
 
 @dataclass
@@ -294,7 +294,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="本地、AI和外部确认融合")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).resolve().parent / "config.yaml"),
+        default=str(Path(__file__).resolve().parents[2] / "config.yaml"),
         help="统一配置文件路径",
     )
     parser.add_argument(
@@ -307,7 +307,7 @@ def main() -> None:
     if args.self_test:
         run_self_test(config)
     else:
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(config, args.config, stage="ai")
 

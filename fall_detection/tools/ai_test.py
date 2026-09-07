@@ -262,7 +262,7 @@ def judge_fall(
         (None, 原始回答)  ：不确定、断网、超时或调用失败。
     """
     if config is None:
-        default_config = Path(__file__).resolve().parent / "config.yaml"
+        default_config = Path(__file__).resolve().parents[2] / "config.yaml"
         config = load_config(str(default_config))
 
     validate_ai_config(config)
@@ -329,7 +329,7 @@ def judge_fall(
 
 def main() -> None:
     """命令行单图测试入口。"""
-    default_config = Path(__file__).resolve().parent / "config.yaml"
+    default_config = Path(__file__).resolve().parents[2] / "config.yaml"
 
     parser = argparse.ArgumentParser(
         description="豆包视觉模型单图跌倒测试"

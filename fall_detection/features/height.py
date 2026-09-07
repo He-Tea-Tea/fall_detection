@@ -25,7 +25,7 @@ from typing import Deque, Dict, Optional, Tuple
 import numpy as np
 import yaml
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -465,7 +465,7 @@ def main() -> None:
         run_self_test(config)
     else:
         # 相机采集和可视化统一由main.py负责，本文件只计算高度分H。
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(
             config,

@@ -31,7 +31,7 @@ from typing import Optional, Sequence
 import numpy as np
 import yaml
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 # COCO 17个人体关键点编号。
 LEFT_SHOULDER = 5
@@ -605,7 +605,7 @@ def main() -> None:
         run_self_test(config)
     else:
         # 相机采集和可视化由main.py统一负责，本文件只提供二维姿态计算。
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(
             config,

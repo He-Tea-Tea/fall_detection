@@ -817,7 +817,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         default=str(
-            Path(__file__).resolve().parent / "config.yaml"
+            Path(__file__).resolve().parents[2] / "config.yaml"
         ),
         help="统一配置文件路径",
     )
@@ -833,7 +833,7 @@ def main() -> None:
         run_self_test(config)
     else:
         # 相机只允许由main.py统一打开，避免多个文件重复占用相机。
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(
             config,

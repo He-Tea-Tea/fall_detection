@@ -17,8 +17,8 @@ from typing import Callable, Dict, List, Optional
 
 import yaml
 
-from ai_verifier import AIVerificationResult
-from decision_fusion import FusionDecision
+from .ai_verifier import AIVerificationResult
+from ..domain.decision_fusion import FusionDecision
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="跌倒告警接口管理器")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).resolve().parent / "config.yaml"),
+        default=str(Path(__file__).resolve().parents[2] / "config.yaml"),
         help="统一配置文件路径",
     )
     parser.add_argument(

@@ -28,7 +28,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import yaml
 
-from logging_utils import configure_logging
+from ..infrastructure.logging_utils import configure_logging
 
 AI_FALL = "FALL"
 AI_NO_FALL = "NO_FALL"
@@ -1083,7 +1083,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="豆包视觉模型单图跌倒复核")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).resolve().parent / "config.yaml"),
+        default=str(Path(__file__).resolve().parents[2] / "config.yaml"),
         help="统一配置文件路径",
     )
     parser.add_argument(
@@ -1098,13 +1098,13 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = load_config(args.config)
-    configure_logging(config, Path(__file__).resolve().parent)
+    configure_logging(config, Path(__file__).resolve().parents[2])
     if args.self_test:
         run_self_test(config)
     elif args.api_test:
         run_api_test(config, args.api_test)
     else:
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(config, args.config, stage="ai")
 

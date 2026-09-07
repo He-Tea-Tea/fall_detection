@@ -19,6 +19,7 @@
 
 import os
 import time
+from pathlib import Path
 import yaml
 import cv2
 import numpy as np
@@ -53,7 +54,8 @@ GROUND_NORMAL_Y_MIN = 0.70
 MIN_GROUND_HEIGHT_M = -0.30
 MAX_GROUND_HEIGHT_M = 2.00
 
-GROUND_FILE = "ground.yaml"  # 输出文件
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+GROUND_FILE = str(PROJECT_ROOT / "assets" / "calibration" / "ground.yaml")
 MAX_DRAW_INLIERS = 3000  # 可视化最多绘制内点数（防 OpenCV 卡顿）
 MIN_FRAME_VALID_RATIO = 0.10  # 单帧至少 10% 像素有有效深度
 MAX_INVALID_FRAMES = 10  # 连续采集时允许的无效帧上限

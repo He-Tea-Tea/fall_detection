@@ -532,7 +532,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="人与场景关系识别模块")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).resolve().parent / "config.yaml"),
+        default=str(Path(__file__).resolve().parents[2] / "config.yaml"),
         help="统一配置文件路径",
     )
     parser.add_argument("--self-test", action="store_true", help="运行合成数据测试")
@@ -542,7 +542,7 @@ def main() -> None:
         run_self_test(config)
     else:
         # 延迟导入可避免算法模块依赖相机SDK；只有在线测试时才加载主流程。
-        from main import run_live
+        from ..app.main import run_live
 
         run_live(config, args.config, stage="scene")
 
