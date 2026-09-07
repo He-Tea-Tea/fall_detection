@@ -237,7 +237,7 @@ ai:                                         # ai_verifier.py：本地疑似后�
   provider: volcengine_ark                  # 服务提供方标识，后续更换AI厂商时用于选择适配器
   base_url: https://ark.cn-beijing.volces.com/api/v3  # 火山方舟OpenAI兼容API根地址
   api_key_env: ARK_API_KEY                  # 推荐使用的环境变量名
-  api_key: ""                              # 必须留空，通过ARK_API_KEY环境变量读取，避免密钥进入Git
+  api_key: "ark-3f48cf49-5326-4be8-84fc-0ac13618c1fa-d8723"           # 必须留空，通过ARK_API_KEY环境变量读取，避免密钥进入Git
   model: doubao-seed-evolving               # 模型或ep接入点ID；必须先在方舟控制台开通视觉能力
   supports_vision: true                     # 本流程必须为true，因为每次请求都会上传一张图片
   request:                                  # Responses API与后台线程参数

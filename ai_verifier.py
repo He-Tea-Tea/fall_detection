@@ -2,7 +2,7 @@
 """豆包视觉模型单图跌倒复核模块。
 
 本文件只负责AI复核，不计算本地P/H/V/S/C：
-1. 本地FallScore达到配置阈值后，为当前人员创建一次单图复核请求；
+1. 本地确认FALL或多证据强疑似时，为当前人员创建一次单图复核请求；
 2. 使用后台线程调用火山方舟Responses API，避免网络等待卡住相机；
 3. 把模型回答统一转换成FALL、NO_FALL或UNCERTAIN；
 4. 请求失败、超时或断网时返回失败结果，主流程自动继续使用本地判断；
@@ -18,6 +18,7 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -27,9 +28,12 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import yaml
 
+from logging_utils import configure_logging
+
 AI_FALL = "FALL"
 AI_NO_FALL = "NO_FALL"
 AI_UNCERTAIN = "UNCERTAIN"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,6 +59,12 @@ class AIFrameObservation:
     static_duration_s: Optional[float]
     scene_relation: str
     scene_confidence: float
+    pose_2d_score: float = 0.0
+    height_drop_score: float = 0.0
+    height_drop_valid: bool = False
+    ground_state: str = "UNKNOWN"
+    ground_quality: float = 0.0
+    pose_conflict: bool = False
     image_jpeg: Optional[bytes] = field(default=None, repr=False)
 
     @staticmethod
@@ -87,6 +97,12 @@ class AIFrameObservation:
             "static_duration_s": self._number(self.static_duration_s),
             "scene_relation": str(self.scene_relation),
             "scene_confidence": self._number(self.scene_confidence),
+            "P2D_pose": self._number(self.pose_2d_score),
+            "H_drop": self._number(self.height_drop_score),
+            "H_drop_valid": bool(self.height_drop_valid),
+            "ground_state": str(self.ground_state),
+            "ground_quality": self._number(self.ground_quality),
+            "pose_2d_3d_conflict": bool(self.pose_conflict),
         }
 
 
@@ -380,23 +396,20 @@ class ArkResponsesClient:
             payload = self.build_payload(request)
             if self.debug_enabled:
                 image_size_kb = len(observation.image_jpeg or b"") / 1024.0
-                print(
-                    "[AI DEBUG] API请求开始："
-                    f"ID={request.person_id} event={request.event_id} "
-                    f"local={observation.local_fall_score:.2f} "
-                    f"jpeg={image_size_kb:.1f}KB model={self.model}"
+                logger.info(
+                    "AI请求开始：ID=%d event=%s local=%.2f jpeg=%.1fKB model=%s",
+                    request.person_id, request.event_id,
+                    observation.local_fall_score, image_size_kb, self.model,
                 )
             response = self._request_api(payload)
             raw_answer = self._extract_answer_text(response)
             verdict, confidence, reason, observations = self._parse_answer(raw_answer)
             completed_s = time.monotonic()
             if self.debug_enabled:
-                print(
-                    "[AI DEBUG] API请求完成："
-                    f"ID={request.person_id} verdict={verdict} "
-                    f"confidence={confidence:.2f} "
-                    f"latency={completed_s - started_s:.2f}s "
-                    f"answer={raw_answer!r}"
+                logger.info(
+                    "AI请求完成：ID=%d verdict=%s confidence=%.2f latency=%.2fs answer=%r",
+                    request.person_id, verdict, confidence,
+                    completed_s - started_s, raw_answer,
                 )
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -420,10 +433,10 @@ class ArkResponsesClient:
         except Exception as error:
             completed_s = time.monotonic()
             if self.debug_enabled:
-                print(
-                    "[AI DEBUG] API请求失败，改用本地判断："
-                    f"ID={request.person_id} latency={completed_s - started_s:.2f}s "
-                    f"error={type(error).__name__}: {error}"
+                logger.warning(
+                    "AI请求失败，改用本地判断：ID=%d latency=%.2fs error=%s: %s",
+                    request.person_id, completed_s - started_s,
+                    type(error).__name__, error,
                 )
             return AIVerificationResult(
                 event_id=request.event_id,
@@ -517,7 +530,7 @@ class AsyncAIVerifier:
 
 
 class AIFallCoordinator:
-    """管理0.50触发、单图提交、冷却、断网退避和最新AI结果。"""
+    """管理双路径事件触发、单图提交、冷却、断网退避和最新AI结果。"""
 
     def __init__(
         self,
@@ -532,6 +545,8 @@ class AIFallCoordinator:
         self.consecutive_risk: Dict[int, int] = defaultdict(int)
         self.last_submit_s: Dict[int, float] = {}
         self.latest_local_score: Dict[int, float] = {}
+        self.trigger_reasons: Dict[int, str] = {}
+        self.requested_episode_reason: Dict[int, str] = {}
         self.ignored_event_ids: Set[str] = set()
         self.failure_count = 0
         self.backoff_until_s = 0.0
@@ -545,12 +560,79 @@ class AIFallCoordinator:
     def supports_vision(self) -> bool:
         return bool(self.verifier.client.supports_vision)
 
-    def _risk_triggered(self, observation: AIFrameObservation) -> bool:
-        """本地FallScore达到阈值就认为值得上传，不再强制其他维度。"""
-        return bool(
-            observation.local_fall_score
-            >= float(self.cfg["trigger"]["fall_score"])
+    def _trigger_reason(self, observation: AIFrameObservation) -> str:
+        """返回AI触发原因；空字符串表示当前帧不应上传。
+
+        v0.95保留两条安全路径：本地已经确认FALL时立即复核；本地尚未确认，
+        但可靠P2D与运动/地面场景组成强疑似时也复核，避免地面失效造成漏报。
+        """
+        trigger_cfg = self.cfg["trigger"]
+        if observation.data_quality < float(trigger_cfg.get("min_data_quality", 0.50)):
+            return ""
+
+        if (
+            observation.local_label == "FALL"
+            and observation.local_fall_score >= float(trigger_cfg["fall_score"])
+            and observation.pose_score >= float(trigger_cfg.get("min_pose_score", 0.50))
+        ):
+            return "LOCAL_CONFIRMED_FALL"
+
+        suspicious_cfg = trigger_cfg.get("suspicious", {})
+        if not bool(suspicious_cfg.get("enabled", True)):
+            return ""
+        pose_suspicious = observation.pose_2d_score >= float(
+            suspicious_cfg.get("min_pose_2d_score", 0.80)
         )
+        drop_suspicious = (
+            observation.height_drop_valid
+            and observation.height_drop_score >= float(
+                suspicious_cfg.get("min_height_drop_score", 0.55)
+            )
+        )
+        velocity_suspicious = observation.velocity_score >= float(
+            suspicious_cfg.get("min_velocity_score", 0.55)
+        )
+        floor_suspicious = (
+            observation.scene_relation == "lying_on_floor"
+            and observation.scene_confidence >= float(
+                suspicious_cfg.get("min_floor_confidence", 0.60)
+            )
+        )
+        local_suspicious = observation.local_fall_score >= float(
+            suspicious_cfg.get("min_local_score", 0.55)
+        )
+        ground_unusable = observation.ground_state not in {"VALID", "FIXED"}
+
+        # 姿态是必选项，再要求运动、地面场景或较高本地总分中的至少一项。
+        support_count = sum(
+            int(value)
+            for value in (
+                drop_suspicious,
+                velocity_suspicious,
+                floor_suspicious,
+                local_suspicious,
+            )
+        )
+        if pose_suspicious and support_count >= int(suspicious_cfg.get("min_support_count", 1)):
+            return "STRONG_SUSPICION"
+
+        # 地面正在重估时，本地H/V/P3D可能被主动禁用；更严格的纯2D姿态仍可
+        # 触发一次AI兜底，避免“本地不确认FALL就永远没有图片复核”的死区。
+        if (
+            ground_unusable
+            and observation.pose_2d_score >= float(
+                suspicious_cfg.get("ground_invalid_pose_2d_score", 0.90)
+            )
+            and observation.local_fall_score >= float(
+                suspicious_cfg.get("ground_invalid_local_score", 0.75)
+            )
+        ):
+            return "GROUND_DEGRADED_RESCUE"
+        return ""
+
+    def _risk_triggered(self, observation: AIFrameObservation) -> bool:
+        """兼容旧测试接口；实际触发原因由_trigger_reason返回。"""
+        return bool(self._trigger_reason(observation))
 
     def _request_allowed(self, observation: AIFrameObservation) -> bool:
         """检查密钥、视觉能力、连续帧、冷却、队列和网络退避。"""
@@ -561,17 +643,40 @@ class AIFallCoordinator:
         if not self.supports_vision:
             return False
 
-        if self._risk_triggered(observation):
+        trigger_reason = self._trigger_reason(observation)
+        if trigger_reason:
             self.consecutive_risk[person_id] += 1
+            self.trigger_reasons[person_id] = trigger_reason
         else:
             self.consecutive_risk[person_id] = 0
+            self.trigger_reasons.pop(person_id, None)
+            reset_score = float(self.cfg["trigger"].get("episode_reset_score", 0.35))
+            reset_pose = float(self.cfg["trigger"].get("episode_reset_pose_2d_score", 0.35))
+            if observation.local_fall_score <= reset_score and observation.pose_2d_score <= reset_pose:
+                self.requested_episode_reason.pop(person_id, None)
             return False
 
-        required_frames = int(self.cfg["trigger"]["consecutive_frames"])
+        required_frames = (
+            1
+            if trigger_reason == "LOCAL_CONFIRMED_FALL"
+            else int(self.cfg["trigger"].get("suspicious_consecutive_frames", self.cfg["trigger"]["consecutive_frames"]))
+        )
         if self.consecutive_risk[person_id] < required_frames:
             return False
         if person_id in self.pending_people or now < self.backoff_until_s:
             return False
+
+        # 同一风险事件只上传一次；若先以强疑似上传、后来本地正式确认FALL，
+        # 允许再上传一次升级复核。恢复到低风险后会自动开启下一事件。
+        previous_reason = self.requested_episode_reason.get(person_id)
+        if previous_reason == trigger_reason:
+            return False
+        if previous_reason == "LOCAL_CONFIRMED_FALL":
+            return False
+
+        # 强疑似已经上传后，本地正式切换为FALL属于事件升级，不受普通冷却限制。
+        if previous_reason and trigger_reason == "LOCAL_CONFIRMED_FALL":
+            return True
 
         cooldown_key = (
             "fall_recheck_s"
@@ -587,7 +692,7 @@ class AIFallCoordinator:
         observation: AIFrameObservation,
         image_provider: Optional[Callable[[], Optional[bytes]]] = None,
     ) -> bool:
-        """风险达到0.50时获取当前单帧并异步提交；返回是否提交成功。"""
+        """本地确认或强疑似达标时获取单帧并异步提交；返回是否成功。"""
         self.latest_local_score[int(observation.person_id)] = float(
             observation.local_fall_score
         )
@@ -610,17 +715,18 @@ class AIFallCoordinator:
         )
         if not self.verifier.submit(verification_request):
             if self.debug_enabled:
-                print(f"[AI DEBUG] 请求队列已满，本次跳过：ID={person_id}")
+                logger.warning("AI请求队列已满，本次跳过：ID=%d", person_id)
             return False
 
         self.pending_people[person_id] = event_id
         self.last_submit_s[person_id] = now
+        trigger_reason = self.trigger_reasons.get(person_id, "UNKNOWN")
+        self.requested_episode_reason[person_id] = trigger_reason
         self.consecutive_risk[person_id] = 0
         if self.debug_enabled:
-            print(
-                "[AI DEBUG] 单图请求已提交后台线程："
-                f"ID={person_id} event={event_id} "
-                f"FallScore={observation.local_fall_score:.2f}"
+            logger.info(
+                "AI单图请求已提交：ID=%d event=%s reason=%s FallScore=%.2f",
+                person_id, event_id, trigger_reason, observation.local_fall_score,
             )
         return True
 
@@ -650,9 +756,9 @@ class AIFallCoordinator:
                 )
                 self.backoff_until_s = now + delay
                 if self.debug_enabled:
-                    print(
-                        "[AI DEBUG] 进入网络退避："
-                        f"连续失败={self.failure_count}，暂停={delay:.1f}s"
+                    logger.warning(
+                        "AI进入网络退避：连续失败=%d，暂停=%.1fs",
+                        self.failure_count, delay,
                     )
         return accepted_results
 
@@ -751,6 +857,8 @@ class AIFallCoordinator:
         self.consecutive_risk.pop(person_id, None)
         self.last_submit_s.pop(person_id, None)
         self.latest_local_score.pop(person_id, None)
+        self.trigger_reasons.pop(person_id, None)
+        self.requested_episode_reason.pop(person_id, None)
 
     def close(self) -> None:
         """关闭后台线程池。"""
@@ -779,17 +887,23 @@ def _test_observation(image_jpeg: bytes = b"fake-jpeg") -> AIFrameObservation:
         static_duration_s=1.2,
         scene_relation="lying_on_floor",
         scene_confidence=0.85,
+        pose_2d_score=0.90,
+        height_drop_score=0.70,
+        height_drop_valid=True,
+        ground_state="VALID",
+        ground_quality=0.90,
         image_jpeg=image_jpeg,
     )
 
 
 def run_self_test(config: dict) -> None:
-    """验证Responses格式、0.50触发、单图、异步结果和断网降级。"""
+    """验证双路径触发、Responses格式、单图、异步结果和断网降级。"""
     test_config = json.loads(json.dumps(config))
     test_config["ai"]["enabled"] = True
     test_config["ai"]["supports_vision"] = True
     test_config["ai"]["trigger"]["fall_score"] = 0.50
     test_config["ai"]["trigger"]["consecutive_frames"] = 1
+    test_config["ai"]["trigger"]["suspicious_consecutive_frames"] = 1
 
     def fake_transport(payload: dict) -> dict:
         content = payload["input"][0]["content"]
@@ -820,10 +934,21 @@ def run_self_test(config: dict) -> None:
     assert results[0].usable and results[0].verdict == AI_FALL
     assert results[0].includes_images
 
-    # 低于0.50不能编码图片，也不能提交API。
+    # 同一风险事件、同一触发原因不得重复上传。
+    observation.timestamp_s = 10.2
+    observation.image_jpeg = b""
+    assert not coordinator.observe(observation, image_provider=image_provider)
+    assert len(image_provider_calls) == 1
+
+    # 总分、P2D和运动证据都低时不能编码图片，也不能提交API。
     low_risk = _test_observation(image_jpeg=b"")
     low_risk.person_id = 2
     low_risk.local_fall_score = 0.49
+    low_risk.pose_2d_score = 0.20
+    low_risk.height_drop_score = 0.0
+    low_risk.velocity_score = 0.0
+    low_risk.scene_relation = "unknown"
+    low_risk.scene_confidence = 0.0
     assert not coordinator.observe(low_risk, image_provider=image_provider)
     assert len(image_provider_calls) == 1
     coordinator.close()
@@ -846,7 +971,7 @@ def run_self_test(config: dict) -> None:
     assert not offline_result.success
     assert offline_result.verdict == AI_UNCERTAIN
     print("ai_verifier self-test: PASS")
-    print("  Responses API, 0.50 trigger, one image, async and offline fallback=PASS")
+    print("  dual trigger, one-image event, async API and offline fallback=PASS")
 
 
 def _load_image_input(image_input: str, config: dict,) -> Tuple[bytes, str, str]:
@@ -973,6 +1098,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = load_config(args.config)
+    configure_logging(config, Path(__file__).resolve().parent)
     if args.self_test:
         run_self_test(config)
     elif args.api_test:

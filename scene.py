@@ -127,6 +127,16 @@ class SceneScorer:
         self.min_depth_m = float(depth_cfg["min_depth_m"])
         self.max_depth_m = float(depth_cfg["max_depth_m"])
 
+        self.ground_plane = np.zeros(4, dtype=np.float64)
+        self.set_ground_plane(ground_plane)
+        self.histories: Dict[int, deque] = defaultdict(lambda: deque(maxlen=self.history_length))
+
+    def set_ground_plane(
+        self,
+        ground_plane: Sequence[float],
+        reset_histories: bool = False,
+    ) -> None:
+        """接收GroundManager的新地面；切换平面时可清除旧场景投票。"""
         plane = np.asarray(ground_plane, dtype=np.float64)
         if plane.shape != (4,):
             raise ValueError("ground_plane必须是[A,B,C,D]")
@@ -134,7 +144,8 @@ class SceneScorer:
         if normal_norm < 1e-8:
             raise ValueError("地面法向量无效")
         self.ground_plane = plane / normal_norm
-        self.histories: Dict[int, deque] = defaultdict(lambda: deque(maxlen=self.history_length))
+        if reset_histories and hasattr(self, "histories"):
+            self.histories.clear()
 
     def point_ground_height(self, point: Optional[np.ndarray]) -> Optional[float]:
         """计算3D点到地面的绝对距离，单位米。"""

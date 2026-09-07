@@ -159,22 +159,30 @@ class Pose3DDetector:
         if self.angle_fall_deg <= self.angle_normal_deg:
             raise ValueError("pose_3d.angle_fall_deg必须大于angle_normal_deg")
 
-        # ground_plane必须是[A, B, C, D]四个数。
-        plane = np.asarray(ground_plane, dtype=np.float64)
-        if plane.shape != (4,):
-            raise ValueError("ground_plane必须是[A, B, C, D]")
-
-        normal_length = float(np.linalg.norm(plane[:3]))
-        if normal_length < 1e-8:
-            raise ValueError("地面法向量无效")
-
-        # 只保存单位地面法向量，后面用于计算人体轴线夹角。
-        self.ground_normal = plane[:3] / normal_length
+        # 地面可以由GroundManager在线更新，因此通过统一方法保存法向量。
+        self.ground_normal = np.zeros(3, dtype=np.float64)
+        self.set_ground_plane(ground_plane)
 
         # 每个人、每种测量模式分别保存角度历史，避免不同人员或模式混用。
         self.histories: Dict[Tuple[int, str], deque] = defaultdict(
             lambda: deque(maxlen=self.history_length)
         )
+
+    def set_ground_plane(
+        self,
+        ground_plane: Sequence[float],
+        reset_histories: bool = False,
+    ) -> None:
+        """更新地面法向量；接受新地面时可同时清除旧角度历史。"""
+        plane = np.asarray(ground_plane, dtype=np.float64)
+        if plane.shape != (4,):
+            raise ValueError("ground_plane必须是[A, B, C, D]")
+        normal_length = float(np.linalg.norm(plane[:3]))
+        if normal_length < 1e-8:
+            raise ValueError("地面法向量无效")
+        self.ground_normal = plane[:3] / normal_length
+        if reset_histories and hasattr(self, "histories"):
+            self.histories.clear()
 
     def _point_valid(
         self,
@@ -543,4 +551,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
