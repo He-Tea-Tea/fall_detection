@@ -1,0 +1,124 @@
+v0.97 CHANGELOG
+================
+
+版本类型：部署与工程化整理版本
+适用项目：RGB-D Fall Detection
+代码算法基线：v0.96.0
+记录日期：2026-09-07
+
+一、版本目标
+
+本版本围绕 Ubuntu 22.04 工控机部署、项目依赖隔离、ONNX运行准备、目录职责和维护流程进行整理。P/H/V/S/C 五维评分、地面质量保护、AI复核、HTTP通讯和音频告警的业务公式保持 v0.96 行为。
+
+二、已整理内容
+
+1. 重写项目 README.md
+
+(1) 按当前目录结构重新说明 assets、audio、deploy、docs、Log、python_packages、tests 和源码包的职责。
+(2) 增加 app、domain、features、perception、integrations、infrastructure、tools 各源码目录的职责表。
+(3) 增加 RGB-D、Pose/Seg、本地五维评分、AI复核和HTTP输出的数据流说明。
+(4) 增加 Ubuntu 22.04 x86_64 的安装、检查、自测试和启动命令。
+(5) 增加根目录 main.py 与 fall_detection.app.main 两种入口的关系。
+(6) 增加地面标定、在线地面质量、相机移动和重新标定说明。
+(7) 增加模型、地面文件、音频、API Key、日志和AI调试图片的配置说明。
+(8) 增加 HTTP true/false 发送和 /reset 重置接口示例。
+(9) 增加 ModuleNotFoundError、ONNX运行库缺失、相机首帧超时、地面质量低和HTTP失败的排查方法。
+(10) 增加 v1/v2 本地依赖目录的保留、切换和清理规则。
+(11) 增加 Git 提交范围和不应提交的模型、密钥、日志、图片及本地依赖说明。
+
+2. 明确本地依赖目录策略
+
+(1) 使用系统 /usr/bin/python3，不创建 virtualenv、venv 或 Conda 环境。
+(2) 通过 fall_local_python.py 在进程内优先加载 python_packages/vN。
+(3) 每个依赖版本使用独立目录，避免升级 fall 项目时影响 ROS、相机标定和其他项目。
+(4) 使用 install_fall_local.sh 创建新版本目录，已存在的目录拒绝覆盖，避免新旧包混装。
+(5) 保留 deploy/install-vN.json 记录安装过程和解析结果。
+(6) 使用 deploy/requirements.fall-vN.lock.txt 固定已经验收的完整版本。
+(7) 保留 build_tools.* 作为安装阶段临时目录，安装结束后可以清理。
+(8) 当前 v1/v2 目录编号只表示依赖快照，不代表代码版本号。
+
+3. 增加 Ubuntu 22.04 部署流程
+
+(1) 启动前检查 Python 版本、Ubuntu版本和 x86_64 架构。
+(2) 使用本地 launcher 运行 --check、pip check、main.py --self-test 和真实相机流程。
+(3) 明确 Python 搜索路径必须指向项目自己的 python_packages/vN。
+(4) 明确本地Python隔离只能隔离Python包，不能替代相机udev规则、系统动态库、ROS环境和设备权限配置。
+(5) 增加 runtime_local/ultralytics 和 runtime_local/matplotlib 的写入目录处理建议。
+
+4. 增加 ONNX 部署检查
+
+(1) 明确 .onnx 模型需要 onnxruntime CPU运行库。
+(2) 当前实机日志显示：配置已使用 .onnx，但依赖目录中缺少 onnxruntime，程序在模型创建阶段退出。
+(3) 后续应在 requirements.fall-local.txt 增加固定版本，例如：
+    onnxruntime==1.23.2
+(4) 增加ONNX依赖后应新建 python_packages/v2，不要直接改写已经通过检查的 v1。
+(5) 创建 v2 后必须重新执行导入检查、pip check、项目自测试和真实相机验收。
+(6) ONNX模型是否支持当前IR版本和算子，需要通过真实加载验证，不能只根据安装成功判断。
+(7) 如果最终使用 ONNX，应将 fall_local_python.py 的 DEFAULT_DIRECTORY 切换到通过验收的依赖目录。
+
+三、保持不变的业务行为
+
+1. 不修改 P/H/V/S/C 五维评分公式。
+2. 不修改本地 FALL/NO_FALL 状态机的确认和恢复条件。
+3. 不修改 2D/3D 姿态冲突保护逻辑。
+4. 不修改地面质量不足时对绝对高度判断的保护。
+5. 不修改深度髋高跳变保护和历史更新规则。
+6. 不修改本地状态确认后的 AI 单图复核逻辑。
+7. 不修改 AI 失败、超时或断网时的本地回退逻辑。
+8. 不修改 HTTP 最终结果格式：
+   {"fall": true}
+   {"fall": false}
+9. 不修改 /reset 的全部人员和指定 person_id 重置接口。
+10. 不修改 ground_detector.py 的初始地面标定算法。
+11. 不修改 FALL 和恢复音频的触发时机。
+
+四、当前验收结果
+
+已通过：
+
+1. 项目本地依赖目录的导入路径检查。
+2. NumPy、SciPy、OpenCV、Open3D、PyTorch、TorchVision 的基础二进制检查。
+3. pyorbbecsdk2、Ultralytics、OpenAI、PyYAML 和 lap 的导入检查。
+4. 项目 pip check，当前已安装依赖无缺失声明。
+5. ground_manager、measurement_guard、Pose 2D/3D、Height、Velocity、Static、Scene 和 FallDetector 自测试。
+6. AI异步调用、断网回退、决策融合和告警管理自测试。
+7. main.py 无相机集成自测试。
+8. RGB-D相机首帧、HTTP服务和模型流程已启动到真实推理阶段。
+
+尚未完成：
+
+1. 当前 v1 还缺少 onnxruntime，使用 ONNX 模型的完整相机流程尚未通过。
+2. ONNX补齐后，需要确认 Pose和Seg模型都能加载。
+3. ONNX补齐后，需要确认人体框、关键点、Track ID、家具Mask和最终FPS。
+4. ONNX补齐后，需要重新生成 v2 锁定文件。
+5. 工控机上仍需单独确认相机udev权限、桌面显示或无显示运行方式、音频设备和网络API访问。
+
+五、升级到 v0.97 的建议顺序
+
+1. 保留当前 python_packages/v1 作为回退版本。
+2. 在 requirements.fall-local.txt 增加 onnxruntime 固定版本。
+3. 执行 bash install_fall_local.sh v2。
+4. 执行 /usr/bin/python3 -I -S fall_local_python.py --deps v2 --check。
+5. 执行 /usr/bin/python3 -I -S fall_local_python.py --deps v2 -m pip check。
+6. 执行 /usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py --self-test。
+7. 执行 /usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py。
+8. 记录真实相机推理、FPS、内存、CPU占用、AI请求和HTTP发送结果。
+9. 通过实机验收后导出 deploy/requirements.fall-v2.lock.txt。
+10. 将 fall_local_python.py 的默认依赖目录改成 v2。
+11. 连续运行确认稳定后，再考虑删除 v1 和 build_tools.* 临时目录。
+12. 如果仍需回退，只需把默认目录改回 v1，或启动时增加 --deps v1。
+
+六、版本文件处理建议
+
+当前 README 和本更新记录可以先提交，用于记录部署整理。
+
+当 v2 的 ONNX模型加载、真实相机运行和工控机验收全部完成后，再同步修改：
+
+1. VERSION：改为 0.97。
+2. pyproject.toml：将 project.version 改为 0.97.0。
+3. README.md：将当前代码版本改为 v0.97.0。
+4. V0.97_CHANGELOG.txt：补充最终实测FPS、设备、模型和验收日期。
+5. Git提交信息：使用明确的 v0.97 发布说明。
+
+在 ONNX和工控机实测完成前，不建议只修改版本号而把 v0.97 标记为正式运行版本。
+

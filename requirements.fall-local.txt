@@ -1,0 +1,35 @@
+# fall v0.96首轮本地依赖配置：Ubuntu 22.04 / x86_64 / CPython 3.10 / CPU。
+# 这是待设备验收的修复候选；间接依赖在首次安装时解析，验收后再冻结完整版本。
+
+# 保留用户环境报告里的核心算法和相机SDK版本。
+torch==2.3.0+cpu
+torchvision==0.18.0+cpu
+ultralytics==8.4.127
+pyorbbecsdk2==2.1.2
+openai==3.8.0
+opencv-python==4.10.0.84
+lap==0.5.13
+
+# SDK 2.1.2在Python 3.10下要求NumPy低于2，并声明依赖Open3D 0.18.0。
+numpy==1.26.4
+open3d==0.18.0
+
+# 不借用apt目录里的旧科学计算库；以下均装到fall自己的目录并重新验收。
+scipy==1.13.1
+matplotlib==3.8.4
+PyYAML==6.0.2
+
+# 补齐Ultralytics声明的监测依赖；首次解析后会写入完整锁文件。
+nvidia-ml-py>=12.0.0
+
+# 在本地目录提供pip与构建工具，不改变共享环境里的setuptools或colcon。
+pip==25.1.1
+setuptools==79.0.1
+wheel==0.45.1
+packaging==25.0
+
+# CPU运行ONNX模型所需的推理库。
+onnxruntime==1.23.2
+
+# CPU运行ONNX模型所需的推理库。
+onnxruntime==1.23.2
