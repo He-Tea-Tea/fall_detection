@@ -107,6 +107,11 @@ class GroundManager:
         """公开读取当前地面状态，不执行新一轮RANSAC。"""
         return self._unchanged_result(float(now_s))
 
+    def should_update(self, frame_index: int) -> bool:
+        """判断当前帧是否需要执行地面拟合及其前置Mask构建。"""
+        interval = max(1, int(self.cfg["update_interval_frames"]))
+        return self.enabled and int(frame_index) % interval == 0
+
     def _collect_points(
         self,
         depth_m: np.ndarray,
@@ -259,7 +264,7 @@ class GroundManager:
             )
             self.last_result = result
             return result
-        if int(frame_index) % max(1, int(self.cfg["update_interval_frames"])) != 0:
+        if not self.should_update(frame_index):
             return self._unchanged_result(now)
 
         plane, inlier_ratio, rmse, coverage, camera_height, reason = self._estimate_plane(
@@ -333,6 +338,12 @@ class GroundManager:
 def run_self_test(config: dict) -> None:
     """生成理想平面Depth，验证自动估计、质量和相机移动后重估。"""
     test_config = yaml.safe_load(yaml.safe_dump(config))
+    test_config["ground_manager"]["update_interval_frames"] = 3
+    schedule_manager = GroundManager(test_config, [0.0, -1.0, 0.0, 1.0])
+    assert schedule_manager.should_update(0)
+    assert not schedule_manager.should_update(1)
+    assert schedule_manager.should_update(3)
+
     test_config["ground_manager"]["update_interval_frames"] = 1
     test_config["ground_manager"]["stable_frames"] = 2
     test_config["ground_manager"]["min_points"] = 40

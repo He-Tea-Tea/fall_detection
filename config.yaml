@@ -10,7 +10,8 @@ models:                                     # YOLO模型与推理参数
   scene_conf: 0.35                          # 家具检测最低置信度，调低更容易检测遮挡家具
   scene_retina_masks: true                  # 是否输出精细Mask；true边缘更准但稍占显存
   tracker: botsort.yaml                     # 人体跟踪器，用于保持稳定Track ID
-  scene_inference_interval_frames: 3        # 每隔多少帧运行一次家具Seg，调大更省算力
+  scene_inference_interval_frames: 6        # 检测到人体时每隔多少帧运行一次家具Seg
+  scene_idle_interval_frames: 30            # 无人时降低家具Seg频率；出现人体后立即恢复正常频率
 
 #--------------------------------------runtime-------------------------------------#
 runtime:                                    # Windows/Linux和PT/ONNX共用的推理运行参数
@@ -18,6 +19,8 @@ runtime:                                    # Windows/Linux和PT/ONNX共用的�
   use_half: true                            # 仅PT+CUDA启用FP16；CPU和ONNX由后端自行决定精度
   pose_imgsz: 640                           # Pose模型输入尺寸，必须与导出ONNX尺寸一致
   scene_imgsz: 640                          # Seg模型输入尺寸，必须与导出ONNX尺寸一致
+  opencv_threads: 1                         # 限制OpenCV辅助线程，避免与ONNX线程池重复争抢CPU
+  performance_log_interval_s: 5.0           # 每隔多少秒输出处理FPS和Seg实际运行频率
 
 #--------------------------------------camera-------------------------------------#
 camera:                                     # RGB-D取帧与标定一致性检查
@@ -38,7 +41,7 @@ depth:                                      # 深度与3D反投影
 #--------------------------------------ground_manager-------------------------------------#
 ground_manager:                             # 在线地面质量评估与相机移动后的自动重估
   enabled: true                             # true持续检查地面；ground_detector.py仍保留为初始标定工具
-  update_interval_frames: 5                 # 每隔多少帧执行一次轻量地面RANSAC，调大更省CPU
+  update_interval_frames: 10                # 每隔多少帧执行一次地面RANSAC，单次拟合精度保持不变
   roi_start_ratio: 0.52                     # 只从画面该纵向比例以下找地面，0.52表示下方48%
   sample_step_px: 6                         # 深度图稀疏采样步长，调大更快但候选点更少
   person_box_margin_ratio: 0.08             # 在线拟合时人体框向外扩张并排除的比例

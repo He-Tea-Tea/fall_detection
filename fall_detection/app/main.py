@@ -277,6 +277,18 @@ def load_config(path: str) -> dict:
         raise ValueError("runtime.device不能为空")
     if int(runtime_cfg["pose_imgsz"]) <= 0 or int(runtime_cfg["scene_imgsz"]) <= 0:
         raise ValueError("runtime.pose_imgsz和runtime.scene_imgsz必须大于0")
+    if int(runtime_cfg.get("opencv_threads", 1)) <= 0:
+        raise ValueError("runtime.opencv_threads必须大于0")
+    if float(runtime_cfg.get("performance_log_interval_s", 5.0)) <= 0.0:
+        raise ValueError("runtime.performance_log_interval_s必须大于0")
+
+    model_cfg = config["models"]
+    scene_intervals = (
+        int(model_cfg["scene_inference_interval_frames"]),
+        int(model_cfg.get("scene_idle_interval_frames", 30)),
+    )
+    if any(interval <= 0 for interval in scene_intervals):
+        raise ValueError("models中的场景推理间隔必须大于0")
 
     logging_cfg = config["logging"]
     if float(logging_cfg["max_file_size_mb"]) <= 0.0:
@@ -354,6 +366,26 @@ def resolve_inference_runtime(
         scene_model_path.suffix.lower(),
     )
     return device, use_half
+
+
+def should_run_scene_inference(
+    frame_index: int,
+    last_inference_frame: Optional[int],
+    people_present: bool,
+    people_present_last_frame: bool,
+    active_interval: int,
+    idle_interval: int,
+) -> bool:
+    """按画面活动状态决定本帧是否运行场景分割模型。"""
+    if last_inference_frame is None:
+        return True
+
+    # 人物刚进入画面时立即刷新家具关系，避免沿用无人阶段的旧场景结果。
+    if people_present and not people_present_last_frame:
+        return True
+
+    interval = active_interval if people_present else idle_interval
+    return frame_index - last_inference_frame >= interval
 
 
 def load_ground_metadata(path: str) -> dict:
@@ -1919,6 +1951,10 @@ def run_live(
     from pyorbbecsdk import AlignFilter, OBStreamType, Pipeline
     from ultralytics import YOLO
 
+    # OpenCV只承担图像转换和绘制，限制其线程可避免与ONNX推理线程池过度竞争。
+    opencv_threads = int(config["runtime"].get("opencv_threads", 1))
+    cv2.setNumThreads(opencv_threads)
+
     needs_pose_score = stage in {
         "pose_2d",
         "static",
@@ -2142,9 +2178,20 @@ def run_live(
 
         # 家具变化较慢，因此Seg不是每帧运行，帧间复用最近一次结果。
         scene_detections: List[SceneObjectDetection] = []
+        last_scene_inference_frame: Optional[int] = None
+        people_present_last_frame = False
         frame_index = 0
         ground_estimate = ground_manager.current_estimate(time.monotonic())
         last_ground_state = ground_estimate.state
+        display_enabled = bool(config["display"]["enabled"])
+
+        # 性能统计只维护少量计数器，每个周期输出一次，不影响识别结果。
+        performance_started_s = time.monotonic()
+        performance_frame_count = 0
+        performance_scene_count = 0
+        performance_interval_s = float(
+            config["runtime"].get("performance_log_interval_s", 5.0)
+        )
 
         window_name = str(
             config["display"]["window_names"][stage]
@@ -2196,8 +2243,8 @@ def run_live(
             if image is None:
                 continue
 
-            # 模型始终读取未绘制框和Mask的原始图像，避免可视化影响识别结果。
-            inference_image = image.copy()
+            # 两套模型都在绘制前完成推理，可直接复用原帧并避免每帧整图复制。
+            inference_image = image
 
             depth_frame = (
                 frames.get_depth_frame()
@@ -2217,41 +2264,6 @@ def run_live(
                         logger.warning("D2C后RGB与Depth尺寸不一致，本帧使用纯2D模式")
                     depth_m = create_missing_depth(image.shape[:2])
 
-            # 家具Seg按照配置的间隔运行，其余帧复用最近一次检测结果。
-            if needs_scene and scene_model is not None:
-                interval = max(
-                    int(
-                        config["models"][
-                            "scene_inference_interval_frames"
-                        ]
-                    ),
-                    1,
-                )
-
-                if frame_index % interval == 0:
-                    scene_results = scene_model(
-                        inference_image,
-                        conf=float(config["models"]["scene_conf"]),
-                        imgsz=int(config["runtime"]["scene_imgsz"]),
-                        device=inference_device,
-                        half=use_half,
-                        retina_masks=bool(
-                            config["models"]["scene_retina_masks"]
-                        ),
-                        verbose=False,
-                    )
-                    first_scene_result = (
-                        scene_results[0]
-                        if scene_results
-                        else None
-                    )
-                    scene_detections = parse_scene_detections(
-                        first_scene_result,
-                        config["scene"]["target_class_map"],
-                        image.shape[:2],
-                        config["scene"],
-                    )
-
             # YOLO Pose每帧运行；persist=True让跟踪器保存跨帧状态。
             pose_results = pose_model.track(
                 inference_image,
@@ -2263,20 +2275,81 @@ def run_live(
                 half=use_half,
                 verbose=False,
             )
+
+            # Pose张量只转换一次，后续地面排除和逐人计算共用同一份NumPy结果。
+            pose_result = pose_results[0] if pose_results else None
+            boxes = np.empty((0, 4), dtype=np.float32)
+            keypoints = None
+            tracking_valid = False
+            track_ids = np.empty(0, dtype=np.int32)
+
+            if pose_result is not None and pose_result.boxes is not None:
+                boxes = pose_result.boxes.xyxy.cpu().numpy()
+                tracking_valid = pose_result.boxes.id is not None
+                track_ids = (
+                    pose_result.boxes.id.int().cpu().numpy()
+                    if tracking_valid
+                    else np.arange(len(boxes), dtype=np.int32)
+                )
+
+            if pose_result is not None and pose_result.keypoints is not None:
+                keypoints = pose_result.keypoints.data.cpu().numpy()
+
+            # 有人时保持正常场景刷新率；无人时降低Seg频率并继续保留最新家具结果。
+            if needs_scene and scene_model is not None:
+                active_interval = int(
+                    config["models"]["scene_inference_interval_frames"]
+                )
+                idle_interval = int(
+                    config["models"].get("scene_idle_interval_frames", 30)
+                )
+                people_present = len(boxes) > 0
+                scene_due = should_run_scene_inference(
+                    frame_index=frame_index,
+                    last_inference_frame=last_scene_inference_frame,
+                    people_present=people_present,
+                    people_present_last_frame=people_present_last_frame,
+                    active_interval=active_interval,
+                    idle_interval=idle_interval,
+                )
+
+                if scene_due:
+                    scene_results = scene_model(
+                        inference_image,
+                        conf=float(config["models"]["scene_conf"]),
+                        imgsz=int(config["runtime"]["scene_imgsz"]),
+                        device=inference_device,
+                        half=use_half,
+                        retina_masks=bool(
+                            config["models"]["scene_retina_masks"]
+                        ),
+                        verbose=False,
+                    )
+                    first_scene_result = scene_results[0] if scene_results else None
+                    scene_detections = parse_scene_detections(
+                        first_scene_result,
+                        config["scene"]["target_class_map"],
+                        image.shape[:2],
+                        config["scene"],
+                    )
+                    last_scene_inference_frame = frame_index
+                    performance_scene_count += 1
+
+                people_present_last_frame = people_present
+
             now = time.monotonic()
 
             # 在线地面拟合必须排除本帧人体和最近家具Mask，避免把人、床或沙发
-            # 误当成大平面。即使没有检测到人，也继续检查地面质量。
-            ground_boxes = np.empty((0, 4), dtype=np.float32)
-            if pose_results:
-                first_pose_result = pose_results[0]
-                if first_pose_result.boxes is not None:
-                    ground_boxes = first_pose_result.boxes.xyxy.cpu().numpy()
-            exclusion_masks = build_ground_exclusion_masks(
-                image.shape[:2],
-                ground_boxes,
-                scene_detections,
-                float(config["ground_manager"]["person_box_margin_ratio"]),
+            # 误当成大平面。非RANSAC帧不创建整幅布尔Mask，地面结果仍按原逻辑复用。
+            exclusion_masks = (
+                build_ground_exclusion_masks(
+                    image.shape[:2],
+                    boxes,
+                    scene_detections,
+                    float(config["ground_manager"]["person_box_margin_ratio"]),
+                )
+                if ground_manager.should_update(frame_index)
+                else ()
             )
             ground_estimate = ground_manager.update(
                 frame_index,
@@ -2314,34 +2387,15 @@ def run_live(
                 ai_coordinator.poll(now)
 
             # 推理完成以后再画家具，防止Mask和框污染Pose模型输入。
-            if needs_scene:
+            if needs_scene and display_enabled:
                 draw_scene_detections(
                     image,
                     scene_detections,
                     config,
                 )
 
-            if pose_results:
-                result = pose_results[0]
-
-                if (
-                    result.boxes is not None
-                    and result.keypoints is not None
-                ):
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    keypoints = result.keypoints.data.cpu().numpy()
-
-                    # boxes.id存在时才能认为Track ID稳定。
-                    tracking_valid = result.boxes.id is not None
-                    track_ids = (
-                        result.boxes.id.int().cpu().numpy()
-                        if tracking_valid
-                        else np.arange(
-                            len(boxes),
-                            dtype=np.int32,
-                        )
-                    )
-
+            if keypoints is not None and len(boxes) > 0:
+                if len(boxes) == len(keypoints):
                     for index, bbox in enumerate(boxes):
                         if tracking_valid:
                             person_id = int(track_ids[index])
@@ -2636,22 +2690,23 @@ def run_live(
                                     ai_result,
                                 )
 
-                        draw_person(
-                            image,
-                            measurement,
-                            pose_3d_result,
-                            pose_2d_result,
-                            pose_score_result,
-                            height_result,
-                            velocity_result,
-                            static_result,
-                            scene_result,
-                            decision,
-                            ai_status,
-                            fusion_decision,
-                            config,
-                            stage,
-                        )
+                        if display_enabled:
+                            draw_person(
+                                image,
+                                measurement,
+                                pose_3d_result,
+                                pose_2d_result,
+                                pose_score_result,
+                                height_result,
+                                velocity_result,
+                                static_result,
+                                scene_result,
+                                decision,
+                                ai_status,
+                                fusion_decision,
+                                config,
+                                stage,
+                            )
 
                         # 临时负ID不能保留历史，否则下一帧可能串到另一个人。
                         if not tracking_valid:
@@ -2672,37 +2727,55 @@ def run_live(
                 reset_person(stale_id)
                 del last_seen_s[stale_id]
 
-            cv2.putText(
-                image,
-                f"MODE: {stage}",
-                (12, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (0, 255, 255),
-                2,
-            )
-            if bool(config["display"].get("show_ground_status", True)):
-                ground_color = (
-                    (0, 255, 0)
-                    if ground_estimate.usable
-                    else (0, 215, 255)
-                )
+            if display_enabled:
                 cv2.putText(
                     image,
-                    f"GROUND: {ground_estimate.state} Q={ground_estimate.quality:.2f}",
-                    (12, 48),
+                    f"MODE: {stage}",
+                    (12, 24),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52,
-                    ground_color,
+                    0.60,
+                    (0, 255, 255),
                     2,
                 )
+                if bool(config["display"].get("show_ground_status", True)):
+                    ground_color = (
+                        (0, 255, 0)
+                        if ground_estimate.usable
+                        else (0, 215, 255)
+                    )
+                    cv2.putText(
+                        image,
+                        f"GROUND: {ground_estimate.state} Q={ground_estimate.quality:.2f}",
+                        (12, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.52,
+                        ground_color,
+                        2,
+                    )
 
-            if bool(config["display"]["enabled"]):
                 cv2.imshow(window_name, image)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
 
             frame_index += 1
+            performance_frame_count += 1
+            performance_now_s = time.monotonic()
+            performance_elapsed_s = performance_now_s - performance_started_s
+
+            if performance_elapsed_s >= performance_interval_s:
+                processed_fps = performance_frame_count / performance_elapsed_s
+                scene_fps = performance_scene_count / performance_elapsed_s
+                logger.info(
+                    "运行性能：processed_fps=%.2f scene_fps=%.2f "
+                    "scene_interval_active=%d scene_interval_idle=%d",
+                    processed_fps,
+                    scene_fps,
+                    int(config["models"]["scene_inference_interval_frames"]),
+                    int(config["models"].get("scene_idle_interval_frames", 30)),
+                )
+                performance_started_s = performance_now_s
+                performance_frame_count = 0
+                performance_scene_count = 0
 
     except KeyboardInterrupt:
         logger.info("用户请求退出")
@@ -2723,6 +2796,13 @@ def run_live(
 
 def run_self_test(config: dict) -> None:
     """运行所有模块测试，并验证Depth缺失时仍能生成跌倒证据。"""
+    # 验证场景模型在无人时降频，并在人物出现时立即恢复刷新。
+    assert should_run_scene_inference(0, None, False, False, 6, 30)
+    assert not should_run_scene_inference(5, 0, False, False, 6, 30)
+    assert should_run_scene_inference(30, 0, False, False, 6, 30)
+    assert should_run_scene_inference(2, 0, True, False, 6, 30)
+    assert should_run_scene_inference(8, 2, True, True, 6, 30)
+
     ground_self_test(config)
     guard_self_test(config)
     pose_3d_self_test(config)

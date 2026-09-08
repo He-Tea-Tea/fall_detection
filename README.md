@@ -107,8 +107,13 @@ hxb_code/
 | `paths.ground_file` | 地面标定文件，当前为 `assets/calibration/ground.yaml` |
 | `models.pose_model` | 人体 Pose 模型 |
 | `models.scene_model` | 家具 Seg 模型 |
+| `models.scene_inference_interval_frames` | 画面有人时的家具 Seg 推理帧间隔 |
+| `models.scene_idle_interval_frames` | 画面无人时的家具 Seg 推理帧间隔 |
 | `runtime.device` | `auto`、`cpu` 或 GPU编号 |
 | `runtime.use_half` | 只建议在 CUDA + `.pt` 模型时启用 |
+| `runtime.opencv_threads` | OpenCV辅助计算线程数，避免与ONNX线程池争抢CPU |
+| `runtime.performance_log_interval_s` | 处理FPS和Seg实际频率的日志周期 |
+| `ground_manager.update_interval_frames` | 在线地面RANSAC的运行帧间隔 |
 | `display.enabled` | 是否显示 OpenCV 窗口 |
 | `display.show_debug_text` | 是否在人体框下显示详细参数 |
 | `ai.enabled` | 是否启用 AI 复核 |
@@ -130,6 +135,8 @@ onnxruntime==1.23.2
 ```
 
 安装 ONNX 运行库后要创建新的本地依赖目录，例如 `v2`，不要把新旧依赖混装到已经验证的 `v1`。
+
+当前CPU性能策略不会修改Pose模型、输入尺寸、模型置信度或跌倒评分阈值。Pose仍然每帧运行；家具Seg在有人时每6帧运行一次、无人时每30帧运行一次，人物重新进入画面时立即刷新。在线地面RANSAC每10帧运行一次，并且只在该帧创建排除Mask。主循环不再复制整帧图像，关闭`display.enabled`后还会跳过全部绘图。运行日志每5秒输出`processed_fps`和`scene_fps`，用于实机对比优化前后的处理能力。
 
 ## 6. Ubuntu 22.04 本地依赖部署
 
@@ -329,4 +336,3 @@ git commit -m "docs: update fall detection deployment guide for v0.97"
 适用系统：Ubuntu 22.04 x86_64，Python 3.10；Windows可继续使用项目原有环境。  
 当前代码版本：`v0.96.0`。  
 文档更新：`v0.97` 部署准备。
-
