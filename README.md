@@ -14,7 +14,7 @@
 - 人与地面、床、沙发、椅子的场景关系。
 - P/H/V/S/C 五维本地评分和 `FALL/NO_FALL` 二值状态机。
 - 深度质量异常、2D/3D姿态冲突和地面质量保护。
-- 本地检测确认后可选上传一张图片给豆包视觉模型复核。
+- 满足本地确认或强疑似触发条件时，可选上传一张图片给豆包视觉模型复核。
 - AI 失败或断网时继续使用本地结果。
 - HTTP POST 发送最终 `true/false`，HTTP `/reset` 接收外部重置命令。
 - 日志、告警音频和 AI 调试图片均可通过 `config.yaml` 配置。
@@ -107,13 +107,8 @@ hxb_code/
 | `paths.ground_file` | 地面标定文件，当前为 `assets/calibration/ground.yaml` |
 | `models.pose_model` | 人体 Pose 模型 |
 | `models.scene_model` | 家具 Seg 模型 |
-| `models.scene_inference_interval_frames` | 画面有人时的家具 Seg 推理帧间隔 |
-| `models.scene_idle_interval_frames` | 画面无人时的家具 Seg 推理帧间隔 |
 | `runtime.device` | `auto`、`cpu` 或 GPU编号 |
 | `runtime.use_half` | 只建议在 CUDA + `.pt` 模型时启用 |
-| `runtime.opencv_threads` | OpenCV辅助计算线程数，避免与ONNX线程池争抢CPU |
-| `runtime.performance_log_interval_s` | 处理FPS和Seg实际频率的日志周期 |
-| `ground_manager.update_interval_frames` | 在线地面RANSAC的运行帧间隔 |
 | `display.enabled` | 是否显示 OpenCV 窗口 |
 | `display.show_debug_text` | 是否在人体框下显示详细参数 |
 | `ai.enabled` | 是否启用 AI 复核 |
@@ -136,8 +131,6 @@ onnxruntime==1.23.2
 
 安装 ONNX 运行库后要创建新的本地依赖目录，例如 `v2`，不要把新旧依赖混装到已经验证的 `v1`。
 
-当前CPU性能策略不会修改Pose模型、输入尺寸、模型置信度或跌倒评分阈值。Pose仍然每帧运行；家具Seg在有人时每6帧运行一次、无人时每30帧运行一次，人物重新进入画面时立即刷新。在线地面RANSAC每10帧运行一次，并且只在该帧创建排除Mask。主循环不再复制整帧图像，关闭`display.enabled`后还会跳过全部绘图。运行日志每5秒输出`processed_fps`、`scene_fps`以及`pose_ms`、`scene_ms`、`ground_ms`、`loop_ms`，用于实机定位CPU瓶颈。
-
 ## 6. Ubuntu 22.04 本地依赖部署
 
 本项目不创建虚拟环境或 Conda 环境。它使用系统 `/usr/bin/python3`，再通过 `python_packages/vN` 限制第三方包搜索路径。这样可以让 fall 项目使用自己的 NumPy、OpenCV、PyTorch和相机SDK，不升级其他项目的共享包。
@@ -154,7 +147,6 @@ uname -m
 
 ```bash
 cd ~/hxb_code/fall_detection
-
 # 首次安装使用v1；如果当前配置使用ONNX且v1没有onnxruntime，使用v2。
 bash install_fall_local.sh v1
 ```
@@ -190,37 +182,320 @@ bash install_fall_local.sh v2
 
 安装报告由安装脚本保存为 `deploy/install-v1.json` 或 `deploy/install-v2.json`。
 
-## 7. 测试和启动
+## 7. 各模块独立启动和自测试
 
-无相机自测试：
+### 7.1 运行前先选好依赖目录
 
-```bash
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --self-test
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 -m unittest discover -s tests -v
-```
-
-如果默认依赖目录已经切换为 `v2`，把命令里的 `v1` 换成 `v2`。也可以在 `fall_local_python.py` 中把 `DEFAULT_DIRECTORY` 改成最终通过实机验收的目录。
-
-启动完整相机流程：
+下面的运行示例统一使用 `python_packages/v2`。请先确认这个目录已经安装完整，并且能够通过导入检查。
+如果你实际使用的是 `v1`，把命令中的 `--deps v2` 换成 `--deps v1`；配置使用ONNX时，选中的目录需要包含 `onnxruntime`。
 
 ```bash
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py
+# 进入包含config.yaml和fall_local_python.py的项目根目录。
+cd ~/hxb_code/fall_detection
+
+# 查看本次使用的解释器、依赖目录和Python搜索路径。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 --info
+
+# 检查关键库的真实导入位置和基础二进制功能。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 --check
+
+# 检查选中目录内的包依赖关系。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m pip check
 ```
 
-按功能阶段测试：
+下面采用 `-m fall_detection.包名.模块名` 启动模块，使包内相对导入能够正确工作。
+Linux区分大小写，当前文件名为 `pose_2d.py`、`pose_3d.py`，命令中也使用小写。
+
+命令参数的先后顺序：
+
+| 参数 | 由谁读取 | 用途 |
+| --- | --- | --- |
+| `-I -S` | 系统Python | 限制共享Python包和外部路径对当前进程的影响 |
+| `--deps v2` | `fall_local_python.py` | 选择本项目的依赖目录，应放在目标脚本或 `-m` 之前 |
+| `-m fall_detection.…` | 本地启动器 | 按完整包名执行模块 |
+| `--self-test` | 支持此参数的目标模块 | 运行合成数据测试 |
+| `--config config.yaml` | 支持此参数的目标模块 | 指定运行配置，应放在模块名之后 |
+| `--stage pose_2d` | `main.py` | 选择主流程中的功能测试阶段 |
+
+代码块中的相机命令应逐条选择运行。退出上一个窗口并释放相机后，再启动下一个模块。
+OpenCV窗口需要桌面显示环境；只通过普通SSH终端连接时，可以先运行无相机自测试。
+`display.enabled: true` 控制窗口，`display.show_debug_text: true` 控制窗口中的白色详细参数。
+
+### 7.2 完整流程与统一阶段入口
 
 ```bash
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage pose_3d
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage pose_2d
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage height
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage velocity
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage static
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage scene
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage fall_detector
-/usr/bin/python3 -I -S fall_local_python.py --deps v1 main.py --stage full
+# 完整相机流程：本地检测、可选AI复核、融合、HTTP和音频。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py
+
+# 完整流程的包入口；与上一条任选其一。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.app.main
+
+# 通过主程序打开一个功能阶段，例如二维姿态。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py --stage pose_2d
+
+# 指定配置文件时，把配置参数放到目标脚本后面。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py --config config.yaml
 ```
 
-`--self-test` 不打开相机，也不会向真实 AI 服务发送请求。完整相机验收才会验证模型、SDK、窗口、深度和真实地面数据。
+`main.py --stage` 的可选值：
+
+| 值 | 主要观察内容 |
+| --- | --- |
+| `pose_3d` | 三维姿态角度和P3D |
+| `pose_2d` | 二维姿态角度、人框比例和P2D |
+| `height` | 高度分H、基准髋高、下降量 |
+| `velocity` | 速度分V、髋部垂直速度 |
+| `static` | 静止分S、躯干速度、持续静止时间 |
+| `scene` | 家具Mask、人物场景关系和场景分C |
+| `fall_detector` | 本地五维评分和FALL/NO_FALL状态机 |
+| `ai` | 本地检测与AI复核、最终融合 |
+| `full` | 完整流程，默认值 |
+
+没有 `--stage ground_manager`、`--stage measurement_guard`、`--stage http` 或 `--stage audio`。
+对应功能的验证方法见下文。
+
+### 7.3 姿态、高度、速度、静止和场景：独立相机窗口
+
+这些模块默认调用同一个 `run_live()` 采集流程，选择自己的测试阶段。
+它们仍会加载该阶段所需的模型和基础测量；例如静止分需要姿态、高度和躯干中心作为输入。
+
+```bash
+# 三维姿态：人体3D轴线与地面法向量的角度，显示P3D。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.perception.pose_3d
+
+# 二维姿态：肩到髋连线与画面x轴的角度、人框比例，显示P2D。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.perception.pose_2d
+
+# 高度维度：显示髋高、历史基准、下降量和H。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.features.height
+
+# 速度维度：显示髋部垂直速度、向下速度风险V。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.features.velocity
+
+# 静止维度：显示异常候选后的躯干速度、静止时间和S。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.features.static
+
+# 场景维度：显示床、沙发、椅子Mask及人与场景的关系C。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.perception.scene
+
+# 本地状态机：显示P/H/V/S/C和本地FALL/NO_FALL。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.domain.fall_detector
+```
+
+本地 `fall_detector` 阶段用于检查本地判断。需要验证AI融合后的HTTP结果和音频时，使用 `ai` 或 `full` 阶段。
+
+### 7.4 地面管理、测量保护、AI和融合：在线入口
+
+```bash
+# 在线地面管理：当前实现会打开full窗口，在完整流程中观察ground_quality。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.perception.ground_manager
+
+# 测量保护：当前实现会打开full窗口，观察2D/3D冲突和无效测量原因。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.perception.measurement_guard
+
+# AI复核：打开ai阶段窗口，满足触发条件时才提交图片。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.integrations.ai_verifier
+
+# 决策融合：打开ai阶段窗口，观察本地结果与AI结果如何形成最终状态。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.domain.decision_fusion
+```
+
+`ground_manager` 和 `measurement_guard` 没有专用的纯地面或纯保护在线窗口，默认运行的是 `full`。
+因此这些入口可能按配置启用AI、HTTP和音频；只想检查算法本身时，使用下一节的 `--self-test`。
+初始地面标定使用 `tools.ground_detector`，与在线地面管理是两个入口。
+
+### 7.5 各算法模块：无相机自测试
+
+以下命令使用合成数据，不打开相机。AI自测试使用模拟请求，不会上传真实图片。
+测试仍需要安装相应Python依赖，并能读取当前 `config.yaml`。
+可调整阈值会影响部分自测试断言，报错时先确认所用配置。
+
+```bash
+# 测试3D姿态角度、风险子分和缺失关键点处理。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.perception.pose_3d --self-test
+
+# 测试2D角度、人框比例和姿态分融合。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.perception.pose_2d --self-test
+
+# 测试高度评分、跳变保护和地面可信度相关处理。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.features.height --self-test
+
+# 测试下降速度、缺失高度和历史滤波保护。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.features.velocity --self-test
+
+# 测试异常后静止计时及移动时清除计时。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.features.static --self-test
+
+# 测试家具Mask与深度几何、人物关系和场景评分。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.perception.scene --self-test
+
+# 测试在线地面质量、稳定候选确认和重新估计。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.perception.ground_manager --self-test
+
+# 测试人体几何和2D/3D一致性保护。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.perception.measurement_guard --self-test
+
+# 测试本地状态机、瞬态证据和缺失3D时的处理。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.domain.fall_detector --self-test
+
+# 测试AI触发、异步请求和失败回退；不访问真实API。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.integrations.ai_verifier --self-test
+
+# 测试AI优先、本地回退和最终状态保持。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.domain.decision_fusion --self-test
+
+# 测试告警状态变化和重复事件抑制；不会验证真实HTTP或扬声器。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.integrations.alert_manager --self-test
+```
+
+`alert_manager` 当前默认入口也只执行合成测试，不带参数不会打开相机。
+
+```bash
+# 依次执行各模块合成测试及主流程接口测试。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py --self-test
+
+# 标准unittest入口；当前test_smoke.py会调用同一组集成自测试，二者任选其一。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m unittest discover -s tests -v
+```
+
+### 7.6 相机内参与初始地面标定
+
+执行前先关闭其他占用相机的进程，包括完整检测流程和相机ROS驱动。
+
+```bash
+# 打开相机并在终端打印帧格式、RGB/Depth内参和外参；不显示OpenCV窗口。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.tools.get_intrinsics
+
+# 打开相机拟合地面，保存标定结果并显示地面可视化。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.tools.ground_detector
+```
+
+这两个工具当前没有 `--self-test` 或 `--config` 参数。
+`ground_detector` 的输出由文件内的 `GROUND_FILE` 决定，目前是
+`assets/calibration/ground.yaml`；拟合成功会写入该文件，主流程再通过 `paths.ground_file` 读取。
+
+### 7.7 用一张图片单独测试真实AI
+
+准备实际存在的图片，例如 `assets/images/test.jpg`，并配置可用的视觉模型、API Key和超时。
+下面两种方法都会上传一张真实图片，不打开相机，可以任选其一。
+
+```bash
+# 使用线上复核模块自身的API测试入口。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.integrations.ai_verifier --api-test assets/images/test.jpg
+
+# 使用独立单图测试工具。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 \
+  -m fall_detection.tools.ai_test assets/images/test.jpg
+```
+
+`ai_verifier --api-test` 后必须提供图片参数。
+API测试会直接发送图片，用来检查请求链路；相机AI模式则需要满足本地触发条件。
+单图测试不会验证完整流程的自动触发、融合和HTTP发送。
+
+### 7.8 HTTP结果接收与重置联调
+
+`integrations/http_bridge.py` 当前没有独立 `main()` 或 `--self-test`，
+它由主程序创建。接收示例工具 `tools/receiver.py` 可以独立运行。
+
+终端A：
+
+```bash
+# 启动示例接收程序，监听127.0.0.1:8080/fall；不占用相机。
+cd ~/hxb_code/fall_detection
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.tools.receiver
+```
+
+终端B：
+
+```bash
+# 启动真实检测流程，产生最终状态变化后发送HTTP结果。
+cd ~/hxb_code/fall_detection
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 main.py --stage full
+```
+
+联调前确认 `config.yaml` 中 `http_bridge.enabled: true`，并让
+`http_bridge.target_url` 指向 `http://127.0.0.1:8080/fall`。
+示例接收程序的地址由其文件内的 `LISTEN_HOST`、`LISTEN_PORT`、`RESET_URL` 定义，当前不读取主配置。
+
+在终端A输入：
+
+| 输入 | 作用 |
+| --- | --- |
+| `status` | 查看示例接收程序最后收到的结果 |
+| `reset` | 请求检测程序重置全部人员 |
+| `reset 2` | 请求重置人员ID为2的历史 |
+| `quit` | 关闭示例接收程序 |
+
+实际结果只在最终状态变化时发送，不会每帧发送，也不会因为启动成功就立即发送 `false`。
+外部发来的重置由相机主线程消费队列后执行，HTTP接受请求不等于状态已经同步清除。
+
+### 7.9 音频、日志及其余基础模块
+
+| 模块 | 当前是否有独立运行入口 | 验证方式 |
+| --- | --- | --- |
+| `infrastructure/audio_alert.py` | 没有 | Ubuntu用下面的 `aplay` 检查文件和声卡；事件触发通过 `full` 验证 |
+| `infrastructure/logging_utils.py` | 没有 | 主程序启动后观察终端和 `Log/fall_detection.log` |
+| `integrations/http_bridge.py` | 没有 | 使用上一节的接收工具与 `full` 联调 |
+| 各目录的 `__init__.py` | 没有业务入口 | 用于组成Python包，不需要单独启动 |
+| `domain/decision_fusion.py` | 有 | 在线入口见7.4，自测试见7.5 |
+| `integrations/alert_manager.py` | 只有合成测试入口 | 自测试见7.5，真实告警通过 `full` 验证 |
+
+```bash
+# Ubuntu播放跌倒提示音；路径按audio.fall_file的实际配置修改。
+aplay "audio/Are you ok.wav"
+
+# Ubuntu播放恢复提示音；路径按audio.recovery_file的实际配置修改。
+aplay "audio/care.wav"
+
+# 在另一个终端持续查看日志；按Ctrl+C退出查看。
+tail -f Log/fall_detection.log
+```
+
+`aplay` 只验证音频文件和输出设备，不验证告警事件。
+完整音频链路还需要 `audio.enabled: true`，恢复音频需要 `audio.play_recovery: true`。
+Ubuntu当前音频实现依赖系统的 `aplay`；它不在Python依赖目录中。
+
+### 7.10 ONNX导出工具
+
+此工具不打开相机，用于生成模型文件。导出与运行现有ONNX模型需要的依赖不同：
+`onnxruntime` 用于推理，导出还需要匹配当前Ultralytics版本的 `onnx` 及简化工具等依赖。
+启动器关闭了YOLO自动补装，缺少导出依赖时应先更新本项目的依赖清单。
+
+当前 `fall_detection/tools/export_onnx.py` 的入口写的是根目录下的
+`yolo26s-pose.pt` 和 `yolo26s-seg.pt`，并不读取 `models.pose_model`。
+如果模型位于 `assets/models`，先把文件末尾两次调用改为：
+
+```python
+# 使用项目根目录下的assets/models模型；启动器会把工作目录切到项目根目录。
+if __name__ == "__main__":
+    # 导出人体关键点模型，输入路径需要指向PT权重。
+    export_model("assets/models/yolo26s-pose.pt")
+    # 导出家具实例分割模型。
+    export_model("assets/models/yolo26s-seg.pt")
+```
+
+路径和导出依赖就绪后执行：
+
+```bash
+# 导出两个模型；当前工具采用640输入、batch=1和固定输入尺寸。
+/usr/bin/python3 -I -S fall_local_python.py --deps v2 -m fall_detection.tools.export_onnx
+```
+
+本工具当前没有 `--config`、`--model` 或 `--self-test` 参数。
+已有可用ONNX模型时，无需每次启动前重新导出。
 
 ## 8. 地面标定和相机移动
 
@@ -319,7 +594,6 @@ git add README.md V0.97_CHANGELOG.txt
 git add config.yaml fall_local_python.py install_fall_local.sh
 git add requirements.fall-local.txt pyproject.toml VERSION
 git add fall_detection tests docs .gitignore
-
 git commit -m "docs: update fall detection deployment guide for v0.97"
 ```
 
@@ -333,6 +607,9 @@ git commit -m "docs: update fall detection deployment guide for v0.97"
 - 修改检测算法后应增加代码版本；只更新部署文档或依赖快照时应在变更记录中注明范围。
 
 适用硬件：Orbbec Gemini 335Le RGB-D。  
+
 适用系统：Ubuntu 22.04 x86_64，Python 3.10；Windows可继续使用项目原有环境。  
+
 当前代码版本：`v0.96.0`。  
+
 文档更新：`v0.97` 部署准备。
