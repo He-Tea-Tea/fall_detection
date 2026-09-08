@@ -2189,6 +2189,11 @@ def run_live(
         performance_started_s = time.monotonic()
         performance_frame_count = 0
         performance_scene_count = 0
+        performance_ground_count = 0
+        performance_pose_time_s = 0.0
+        performance_scene_time_s = 0.0
+        performance_ground_time_s = 0.0
+        performance_loop_time_s = 0.0
         performance_interval_s = float(
             config["runtime"].get("performance_log_interval_s", 5.0)
         )
@@ -2199,6 +2204,8 @@ def run_live(
         logger.info("相机测试已启动：stage=%s，按ESC退出", stage)
 
         while True:
+            frame_started_s = time.perf_counter()
+
             # HTTP服务线程只入队；所有状态清理在主线程完成，避免数据竞争。
             for reset_id in bridge.poll_reset_requests():
                 if reset_id is None:
@@ -2265,6 +2272,7 @@ def run_live(
                     depth_m = create_missing_depth(image.shape[:2])
 
             # YOLO Pose每帧运行；persist=True让跟踪器保存跨帧状态。
+            pose_started_s = time.perf_counter()
             pose_results = pose_model.track(
                 inference_image,
                 persist=True,
@@ -2275,6 +2283,7 @@ def run_live(
                 half=use_half,
                 verbose=False,
             )
+            performance_pose_time_s += time.perf_counter() - pose_started_s
 
             # Pose张量只转换一次，后续地面排除和逐人计算共用同一份NumPy结果。
             pose_result = pose_results[0] if pose_results else None
@@ -2314,6 +2323,7 @@ def run_live(
                 )
 
                 if scene_due:
+                    scene_started_s = time.perf_counter()
                     scene_results = scene_model(
                         inference_image,
                         conf=float(config["models"]["scene_conf"]),
@@ -2325,6 +2335,7 @@ def run_live(
                         ),
                         verbose=False,
                     )
+                    performance_scene_time_s += time.perf_counter() - scene_started_s
                     first_scene_result = scene_results[0] if scene_results else None
                     scene_detections = parse_scene_detections(
                         first_scene_result,
@@ -2341,6 +2352,7 @@ def run_live(
 
             # 在线地面拟合必须排除本帧人体和最近家具Mask，避免把人、床或沙发
             # 误当成大平面。非RANSAC帧不创建整幅布尔Mask，地面结果仍按原逻辑复用。
+            ground_update_due = ground_manager.should_update(frame_index)
             exclusion_masks = (
                 build_ground_exclusion_masks(
                     image.shape[:2],
@@ -2348,9 +2360,10 @@ def run_live(
                     scene_detections,
                     float(config["ground_manager"]["person_box_margin_ratio"]),
                 )
-                if ground_manager.should_update(frame_index)
+                if ground_update_due
                 else ()
             )
+            ground_started_s = time.perf_counter()
             ground_estimate = ground_manager.update(
                 frame_index,
                 now,
@@ -2358,6 +2371,9 @@ def run_live(
                 intrinsics,
                 exclusion_masks,
             )
+            performance_ground_time_s += time.perf_counter() - ground_started_s
+            if ground_update_due:
+                performance_ground_count += 1
             if ground_estimate.plane is not None and ground_estimate.usable:
                 ground_plane = ground_estimate.plane
                 pose_3d_detector.set_ground_plane(ground_plane)
@@ -2759,23 +2775,44 @@ def run_live(
 
             frame_index += 1
             performance_frame_count += 1
+            performance_loop_time_s += time.perf_counter() - frame_started_s
             performance_now_s = time.monotonic()
             performance_elapsed_s = performance_now_s - performance_started_s
 
             if performance_elapsed_s >= performance_interval_s:
                 processed_fps = performance_frame_count / performance_elapsed_s
                 scene_fps = performance_scene_count / performance_elapsed_s
+                pose_ms = performance_pose_time_s * 1000.0 / performance_frame_count
+                scene_ms = performance_scene_time_s * 1000.0 / max(
+                    performance_scene_count,
+                    1,
+                )
+                ground_ms = performance_ground_time_s * 1000.0 / max(
+                    performance_ground_count,
+                    1,
+                )
+                loop_ms = performance_loop_time_s * 1000.0 / performance_frame_count
                 logger.info(
                     "运行性能：processed_fps=%.2f scene_fps=%.2f "
+                    "pose_ms=%.1f scene_ms=%.1f ground_ms=%.1f loop_ms=%.1f "
                     "scene_interval_active=%d scene_interval_idle=%d",
                     processed_fps,
                     scene_fps,
+                    pose_ms,
+                    scene_ms,
+                    ground_ms,
+                    loop_ms,
                     int(config["models"]["scene_inference_interval_frames"]),
                     int(config["models"].get("scene_idle_interval_frames", 30)),
                 )
                 performance_started_s = performance_now_s
                 performance_frame_count = 0
                 performance_scene_count = 0
+                performance_ground_count = 0
+                performance_pose_time_s = 0.0
+                performance_scene_time_s = 0.0
+                performance_ground_time_s = 0.0
+                performance_loop_time_s = 0.0
 
     except KeyboardInterrupt:
         logger.info("用户请求退出")
