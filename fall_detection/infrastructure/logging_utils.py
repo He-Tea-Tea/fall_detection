@@ -89,8 +89,9 @@ def configure_logging(config: dict, base_directory: Path) -> logging.Logger:
                 raise ValueError("logging.max_file_size_mb必须大于0")
             if backup_count < 0:
                 raise ValueError("logging.backup_count不能小于0")
+            log_file = log_directory / str(cfg.get("filename", "fall_detection.log"))
             file_handler = RotatingFileHandler(
-                log_directory / str(cfg.get("filename", "fall_detection.log")),
+                log_file,
                 maxBytes=int(max_size_mb * 1024 * 1024),
                 backupCount=backup_count,
                 encoding="utf-8",
@@ -102,4 +103,6 @@ def configure_logging(config: dict, base_directory: Path) -> logging.Logger:
         _CONFIGURED = True
         logger = logging.getLogger("fall_detection")
         logger.info("日志系统初始化完成：level=%s", level_name)
+        if bool(cfg.get("enabled", True)):
+            logger.info("应用日志文件：%s", log_file.resolve())
         return logger
